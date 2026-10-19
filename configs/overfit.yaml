@@ -1,0 +1,23 @@
+model:
+  hidden_dim: 256
+  num_layers: 2
+  num_heads: 4
+  text_dim: 32
+  text_backend: synthetic
+  dropout: 0.0
+  text_dropout: 0.0
+  audio_dropout: 0.0
+  history_dropout: 0.0
+data:
+  backend: synthetic
+  size: 4
+train:
+  device: cpu
+  steps: 600
+  batch_size: 4
+  learning_rate: 0.001
+  weight_decay: 0.0
+  schedule_steps: 1000
+  checkpoint_every: 100
+  log_every: 50
+  output_dir: .runs/overfit

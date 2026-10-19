@@ -1,0 +1,16 @@
+model:
+  hidden_dim: 64
+  num_layers: 2
+  num_heads: 4
+  text_dim: 32
+  text_backend: synthetic
+  rtc: false
+  max_delay: 8
+data:
+  backend: synthetic
+  size: 32
+train:
+  device: cpu
+  steps: 10
+  batch_size: 4
+  output_dir: .runs/smoke

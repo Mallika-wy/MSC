@@ -1,0 +1,24 @@
+model:
+  hidden_dim: 512
+  num_layers: 12
+  num_heads: 8
+  text_backend: t5
+  t5_path: null # Set to a local T5 directory; never downloaded.
+  text_dim: 768
+  freeze_text: true
+  rtc: false # Opt in only for a frozen-prefix RTC deployment model.
+  max_delay: 8
+data:
+  backend: omg
+  root: null # Set to a local official OMG-Data release.
+  split: train
+train:
+  device: cuda:0
+  precision: bf16
+  steps: 100000
+  batch_size: 16
+  warmup_steps: 1000
+  schedule_steps: 100000
+  checkpoint_every: 1000
+  log_every: 10
+  output_dir: .runs/omg

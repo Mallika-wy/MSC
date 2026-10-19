@@ -1,0 +1,47 @@
+"""Atomic trusted-local checkpoints, including RNG and deterministic data position."""
+import os
+import random
+from pathlib import Path
+import numpy as np
+import torch
+
+
+def rng_state():
+    return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None)
+
+
+def restore_rng(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def metadata(model, config):
+    return dict(representation=model.representation.metadata(), audio=model.audio_metadata,
+                text_model_sha256=model.text_encoder.fingerprint if model.text_encoder else None,
+                data=dict(backend=config.data.backend, split=config.data.split, size=config.data.size,
+                          limit_size=config.data.limit_size),
+                flow=dict(type="linear_velocity", time_scale=1000.0, time_sampling="uniform", direction="1_to_0"))
+
+
+def save_checkpoint(path, trainer):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    obj = dict(version=1, model=trainer.model.state_dict(), optimizer=trainer.optimizer.state_dict(),
+               scheduler=trainer.scheduler.state_dict(), scaler=trainer.scaler.state_dict(),
+               step=trainer.step, config=trainer.config.to_dict(), rng=rng_state(),
+               metadata=metadata(trainer.model, trainer.config))
+    temp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    torch.save(obj, temp)
+    temp.replace(path)
+
+
+def load_checkpoint(path):
+    # Contains Python and NumPy RNG state; load only checkpoints you trust.
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+    if obj.get("version") != 1:
+        raise ValueError("Unsupported MSC checkpoint version (OMG checkpoints cannot be imported)")
+    return obj
