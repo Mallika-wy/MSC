@@ -1,0 +1,37 @@
+version: 1
+# Paths resolve against the OMG project root. This is a prototype, not production.
+input_csv: data/AIST++/pairs.csv
+sequences: [gBR_sBM_cAll_d04_mBR0_ch01]
+retarget:
+  gmr_root: ../GMR
+  smpl_model: ../baseline/motion-diffusion-model/body_models/smpl/SMPL_NEUTRAL.pkl
+  gender: neutral
+  allow_nonofficial_model: true
+  dependency_site: /home1/gmh/anaconda3/envs/gmr/lib/python3.10/site-packages
+execution:
+  onnx: models/holomotion/motion_tracking/model.onnx
+  providers: CPUExecutionProvider
+video_preprocess:
+  enabled: true
+  weights: models/person_detection/yolo11n.pt
+  device: cpu
+  output_size: 512
+  fps: 30
+  margin: 1.3
+  crf: 22
+  preview: false
+quality:
+  # Local policy: report mild joint-limit issues, reject persistent falls.
+  # No uncalibrated 150mm global-error rejection gate.
+  strict_joint_limits: false
+  arm_twist:
+    enabled: true
+split:
+  ratios: [1.0, 0.0, 0.0]  # One-sequence smoke only; not an evaluation split.
+  seed: 0
+export:
+  repo_id: local/aistpp-video-motion-smoke
+  episode_frames: 240
+  stride_frames: 120
+output:
+  root: data/processed/aistpp_smoke
