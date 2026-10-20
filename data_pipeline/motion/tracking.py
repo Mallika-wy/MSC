@@ -1,10 +1,24 @@
-"""G1 decoding, numerical validation and optional tracker execution."""
+"""Execute a G1 reference at 50 Hz, save video, and produce 30 Hz labels."""
 from pathlib import Path
+import hashlib
+import json
 
 import numpy as np
 
-from data_pipeline.io import read_json, write_json
-from data_pipeline.schemas.manifest import resolve_uri
+from data_pipeline.io import read_json, sha256_file, write_json
+
+
+def track(reference, reference_version, execution, quality, tracker_version, output):
+    """Choose a cache directory tied to this reference, controller and screening policy."""
+    identity = dict(reference=reference_version, tracker=tracker_version, execution=execution,
+                    quality=quality, implementation=sha256_file(__file__),
+                    screening=sha256_file(Path(__file__).with_name('quality.py')))
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    directory = Path(output) / key
+    directory.mkdir(parents=True, exist_ok=True)
+    result = execute_and_screen(reference, {'execution': execution, 'quality': quality}, directory)
+    write_json(directory / 'fingerprint.json', identity)
+    return {**result, 'path': str((directory / 'paired_motion.npz').resolve()), 'version': tracker_version}
 
 
 def validate_qpos(qpos, times):
@@ -20,54 +34,10 @@ def validate_qpos(qpos, times):
         raise ValueError('Root quaternion must be unit wxyz')
 
 
-def read_global_rows(directory, start, length):
-    import pyarrow.parquet as pq
-    if type(start) is not int or type(length) is not int or start < 0 or length < 2:
-        raise ValueError('Invalid source row range')
-    remaining, offset, pieces, timestamps = length, 0, [], []
-    for path in sorted(Path(directory).glob('chunk-*/*.parquet')):
-        file = pq.ParquetFile(path)
-        for group in range(file.num_row_groups):
-            count = file.metadata.row_group(group).num_rows
-            if remaining and offset + count > start:
-                lo = max(0, start - offset)
-                take = min(count - lo, remaining)
-                data = file.read_row_group(group, columns=['observation.state', 'timestamp']).slice(lo, take)
-                pieces.append(np.asarray(data['observation.state'].to_pylist(), dtype=np.float32))
-                timestamps.append(data['timestamp'].to_numpy().astype(np.float64))
-                remaining -= take
-                start += take
-            offset += count
-            if not remaining:
-                qpos = np.concatenate(pieces)
-                return qpos, np.concatenate(timestamps)
-    raise ValueError('Source row range exceeds local parquet files')
-
-
-def decode(source, inventory, inventory_root):
-    path = resolve_uri(inventory_root, source.uri, inventory.external_roots)
-    if source.fps != 30:
-        raise ValueError('Native G1 requires 30 Hz; use an explicit retarget/resampling stage')
-    if source.format == 'omg_lerobot_g1':
-        qpos, times = read_global_rows(path, source.metadata['row_start'], source.metadata['num_frames'])
-    elif source.format == 'g1_qpos_wxyz':
-        with np.load(path, allow_pickle=False) as data:
-            qpos = data['qpos_36'].astype(np.float32)
-            times = data['timestamps'].astype(np.float64)
-
-    else:
-        raise ValueError(f'No native decoder for {source.format}; retarget is required')
-    validate_qpos(qpos, times)
-    # Legacy LeRobot timestamp columns may be float32; tolerate quantization, not a missing frame.
-    if not np.allclose(times, times[0] + np.arange(len(times))/30, atol=1e-5, rtol=0):
-        raise ValueError('Nonuniform native G1 timeline')
-    return qpos, times
-
-
 def resample_executed(reference, executed, *, control_fps=50., motion_fps=30.):
-    from .motion_quality import resample_motion_at_times
+    from .quality import resample_motion_at_times
     if control_fps != 50 or motion_fps != 30:
-        raise ValueError('Current AIST controller contract is 50 Hz execution and 30 Hz labels')
+        raise ValueError('Controller contract is 50 Hz execution and 30 Hz labels')
     query = np.arange(len(reference), dtype=np.float64) / motion_fps
     source_times = np.arange(len(executed) + 1, dtype=np.float64) / control_fps
     aligned = resample_motion_at_times(np.concatenate((reference[:1], executed)), source_times, query)
@@ -83,7 +53,7 @@ def execute_and_screen(reference, config, output):
     motion_path = output / 'paired_motion.npz'
     quality_path = output / 'quality.json'
     rollout = output / 'tracker_rollout.npz'
-    from data_pipeline.stages.execution_video import save_execution_video
+    from data_pipeline.video.execution import save_execution_video
 
     if motion_path.is_file() and quality_path.is_file():
         video = save_execution_video(rollout)
@@ -94,7 +64,7 @@ def execute_and_screen(reference, config, output):
     import mujoco
     import torch
 
-    from data_pipeline.stages.motion_quality import (
+    from data_pipeline.motion.quality import (
         MotionScreeningConfig,
         screen_executed_motion,
     )

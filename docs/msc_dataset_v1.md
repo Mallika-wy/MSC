@@ -1,138 +1,143 @@
-# MSC Dataset v1
+# 数据处理入口与阅读顺序
 
-## 安装与构建
+当前处理 AIST++、FineDance、AIOZ-GDance 的音频—动作对。OMG 汇总文本入口已移除；
+后续文本原始数据集分别放到 `sources/text/<dataset>/`。
 
-Python >=3.10。离线工具不自动下载原始数据或模型。
+## 从这几个文件开始
 
-```bash
-python -m pip install -e '.[pipeline,test]'
-msc-data discover --source omg --root /path/OMG-Data --out /work/inventory --limit 1
-msc-data build --config /work/build.yaml --stages motion,text --limit 1
-msc-data validate --dataset /work/release --deep-sample 20
-msc-data package --dataset /work/release --out /work/portable --mode bundle
-```
+1. `cli.py`：解析命令，调用 pipeline。
+2. `config.py`：读取 YAML，将路径解析为绝对路径。
+3. `pipeline.py`：逐条组织 GMR、质检、tracker/视频、MERT 和导出。
+4. `sources/audio/<dataset>/dataset.py`：找动作与配对 WAV。
+5. `sources/audio/<dataset>/motion.py`：解码该数据集的人体动作。
+6. `motion/retarget.py`、`motion/tracking.py`：共用 GMR 与 OMG tracker。
 
-`/work/build.yaml`（所有路径相对 YAML 所在目录）：
+新数据集只需提供 `samples(root)` 和 `decode_motion(path, settings)`，
+并在 `sources/audio/__init__.py` 的数据集名单注册。
 
-```yaml
-inventory: inventory
-output: release
-tracker:
-  enabled: false
-```
+## 目录职责
 
-AIST 使用 `discover --source aistpp --root /path/AIST --out /work/inventory --cameras c01 c02`，
-支持 `archives/motions_complete.zip`、已解压 `motions/*.pkl`，以及本机
-`data/raw_audio/AISTpp/edge_aistpp/{motions,wavs}`。同名 WAV 记录为源资产，
-不自动伪造已验证同步或 MERT 缓存；视频可缺失。构建配置见
-[`aistpp_motion.yaml`](../configs/data_pipeline/aistpp_motion.yaml)；`split_assignments` 优先按 sequence_id 指定 split，也兼容旧 split_group_id 配置。
+| 目录/文件 | 负责什么 |
+|---|---|
+| `sources/audio/aistpp/` | AIST++ SMPL 60Hz → 人体关节 30Hz |
+| `sources/audio/finedance/` | FineDance 315D、52个关节的6D旋转；按矩阵行解码 |
+| `sources/audio/gdance/` | 读取拆分人物的索引、SMPL参数和共享音频；含拆分脚本 |
+| `motion/decoding.py` | SMPL-X前向运动学及Y-up → Z-up转换 |
+| `motion/retarget.py` | 人体关节 → 共用GMR → G1参考动作；处理缓存 |
+| `motion/tracking.py` | 50Hz MuJoCo执行、执行缓存、30Hz标签 |
+| `motion/arm_twist.py` | 参考动作的手臂扭转启发式检查 |
+| `motion/quality.py` | 执行动作的跌倒、限位检查与时间重采样 |
+| `audio/mert.py` | WAV预处理与MERT编码，只返回数组与时间戳 |
+| `audio/cache.py` | 特征指纹、去重、保存和复用；共享音乐只编码一次 |
+| `video/execution.py` | 实际执行状态的MuJoCo回放，保存每条已执行动作的视频 |
+| `video/processor.py` | 独立的原始人物RGB视频裁剪入口 |
+| `video/detection.py`、`geometry.py`、`media.py`、`config.py` | 人物检测、裁剪几何、视频读写、参数 |
+| `schema/records.py` | 六类发布记录。保留文本字段以兼容格式，当前流程不生成文本 |
+| `schema/manifest.py` | 元信息与Parquet表的读写 |
+| `schema/validation.py` | 字段、引用、时间覆盖和数据契约检查 |
+| `schema/time_map.py` | 动作与模态时间映射 |
+| `release/audio.py` | 将合格样本转换为发布记录 |
+| `release/export.py`、`validate.py`、`package.py` | 正式导出、检查和搬运打包 |
+| `io.py`、`robot.py` | JSON、指纹、路径解析和G1关节约定 |
+| `examples/process_one_sample.py` | 调试单条样本，调用同一个pipeline |
 
-GMR 直接使用本机 `/home1/gmh/wangyang/motion/GMR`，示例 YAML 的
-`gmr_root: ../../../GMR` 指向这个目录。使用已装齐 GMR/SMPL 依赖的离线 Python 环境：
+FineDance原始数据是SMPL-H；FineDance和GDance目前均使用中性SMPL-X人体近似。
+G1动作统一为36维：根位置3 + 根四元数wxyz 4 + 关节角29，单位米/弧度，Z向上。
 
-```bash
-python -m pip install -e '.[pipeline]'
-msc-data build --config configs/data_pipeline/aistpp_motion.yaml --stages motion
-```
+## 运行
 
-流程：`source decoder → HumanMotion → shared run_gmr() → G1 qpos36`。
-`stages/retarget.py` 直接导入该目录的 `GeneralMotionRetargeting`，不复制 GMR，
-不再维护每个数据集一份 backend/子进程。数据源只负责格式、单位、坐标和时间的解码；
-共用接口为关节名、全局位置（米/Z-up）、wxyz朝向、30Hz秒时间戳、身高和 GMR 骨架配置名。
-新人体格式在 `HUMAN_DECODERS` 注册解码器，之后复用同一求解逻辑；
-同格式的新数据源可复用解码器。OMG 原生 G1 直接跳过重定向。
-已接入 AIST SMPL、FineDance SMPL-H 及拆分后 GDance SMPL 的解码；FineDance 和
-GDance 使用中性 SMPL-X 作为人体近似，时间和音频对齐仍需进一步验证。
+本机使用 `.venv-gmr`，继承已有GMR依赖，并在该环境安装MERT依赖与本地OMG包。
+代码不再把其他项目的site-packages插入sys.path。新环境需安装MSC的pipeline依赖、
+GMR依赖及本地OMG tracker包。
 
-启用 tracker 必须设置 `tracker.enabled: true`、`tracker.onnx` 和显式 `tracker.version`。
-每条已执行轨迹在工作目录的 `tracking/<缓存键>/execution.mp4` 保存 50Hz MuJoCo
-实际状态回放；即使质检拒绝该轨迹也会保留。质量报告的 `execution_video` 指向该文件，
-视频保存在工作目录而非发布包中；需要保留工作目录以便后续检查。
-官方 OMG split 保留，不从旧35D特征推断原始音频。
-当前支持 motion/text build；真实音视频特征提取和统一训练 loader 尚未完成。
-
-原 gmr 环境本身可用。普通启动会被 `~/.local` 中旧 NCCL 污染；
-使用 `python -s` 或 `PYTHONNOUSERSITE=1` 即可排除用户级包，无需重装 Torch。
-本项目 `.venv-gmr` 是继承原 gmr 环境的轻量本地 venv，只补装 PyArrow 和 MSC，
-不修改原 Conda 环境。运行方式：
+在MSC根目录：
 
 ```bash
-PYTHONNOUSERSITE=1 .venv-gmr/bin/python -s -m data_pipeline.cli build \
-  --config configs/data_pipeline/aistpp_motion.yaml --stages motion --limit 1
+export PYTHONNOUSERSITE=1
+export PYTHONPATH="$PWD:$PWD/src"
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export OMP_NUM_THREADS=4
+export LP_NUM_THREADS=4
+
+# 只看即将处理的配对，不加载模型，不产生输出
+.venv-gmr/bin/python -s -m data_pipeline.cli run \
+  --config configs/data_pipeline/aistpp_motion.yaml --limit 3 --dry-run
+
+# 三个数据集分别运行一条；去掉--limit可处理全量
+.venv-gmr/bin/python -s -m data_pipeline.cli run \
+  --config configs/data_pipeline/aistpp_motion.yaml --limit 1
+.venv-gmr/bin/python -s -m data_pipeline.cli run \
+  --config configs/data_pipeline/finedance.yaml --limit 1
+.venv-gmr/bin/python -s -m data_pipeline.cli run \
+  --config configs/data_pipeline/gdance.yaml --limit 1
+
+# 和批处理完全共用逻辑的调试示例
+.venv-gmr/bin/python -s -m data_pipeline.examples.process_one_sample finedance \
+  --output data/processed/debug/finedance
 ```
 
-已验证原环境中的真实 GMR 求解器正常。模型来自 HMR2.0 的公开固定版本文件，源 URL、SHA256、结构和原模型条款说明保存在
-`model/smpl/source.json`；只缓存本地模型，不随代码或数据包分发。
-数据目录与模型路径已写入 `configs/data_pipeline/aistpp_motion.yaml`。
+`--sequence` 可选单个样本或GDance组；`--output` 可指定新的输出目录。
+`--diagnostic` 允许执行未通过参考质检的动作供人工检查，仍不发布失败样本。
+一条数据报错会写出error.json，继续下一条；命令最终在有错误时返回非零状态。
 
-## 数据契约
+GDance需要先有单人索引。本机已拆好，重做时：
+
+```bash
+.venv-gmr/bin/python -s -m data_pipeline.cli split-gdance \
+  --root data/raw_audio/AIOZ-GDance \
+  --output data/processed/AIOZ-GDance-single-person
+```
+
+## 输出和恢复
+
+原始数据在 `data/raw_audio/`，模型在 `model/`，结果在 `data/processed/audio/<dataset>/`。
 
 ```text
-release/
-  dataset.json
-  meta/{sequences,motions,assets,links,annotations,features}.parquet
-  meta/provenance.json
-  motion/shard-*.parquet
-  reports/{quality-*,dataset_summary}.json
-  features/…       # 可选缓存
-  media/…          # bundle 时复制
+output/
+  config.json
+  progress.json
+  summary.json
+  samples/<sample>/
+    status.json
+    error.json                     # 该样本报错时产生
+    reference/<fingerprint>/       # GMR参考动作和报告
+    tracking/<fingerprint>/
+      tracker_rollout.npz           # 真实50Hz执行状态
+      paired_motion.npz             # 对齐到30Hz，首帧初始化状态无效
+      labels.npz                   # 发布时排除初始化帧
+      quality.json
+      execution.mp4                # 512×512、50Hz，包含质检拒绝的执行
+  audio/<fingerprint>/
+    values.npy
+    times.npy
+    features.json
+  release/                         # 只包含通过参考与执行质检的样本
+    dataset.json
+    meta/
+    motion/
+    reports/
 ```
 
-六类实体字段以 [`schemas/records.py`](../data_pipeline/schemas/records.py) 为准；
-原始待解码动作单独用 `SourceMotion` 写入库存 `meta/source_motions.json`。
-原生 release 只存每条完整 G1 qpos36，不生成重叠窗口和冗余 action 列。
-Parquet：`qpos36: fixed_size_list<float32>[36]`，`timestamp_sec: float64`。
+失败后可对同一输出目录重试，已有指纹匹配的计算会复用。
+成功发布后，重跑请使用新的 `--output`；不会覆盖已有release。
+发布按条读取动作，不一次把全部动作放进内存。
+AIST++和FineDance默认train；GDance保留官方train/val/test。共享歌曲或编舞不限制跨集合。
+同一GDance片段的演员共享同一音频资源和特征。
 
-- qpos36 = xyz3 + quat_wxyz4 + joint29；米/弧度，Z-up，30Hz。
-- manifest 包含 schema_version=1.0、机器人关节顺序、URDF/FK资产 SHA256 和 external_roots。
-- Motion 本地时间从零开始；`time_origin_sec` 保留其在公共源序列中的起点。
-- 条件映射：`t_asset = scale*t_motion + offset`，scale>0。
-  旧 AIST `sequence=asset+old_offset` 转换为 `offset=motion_origin-old_offset`。
-- 区间均为 `[start,end)`。音频 point 时间戳为 `[T]`；视频 tubelet 支持区间为 `[T,2]`，均为 float64 秒。
-- 文字可以有多段有效区间；不强制任何样本具有 audio 或 video。
-- AIST 按源动作序列独立分配 split；共享歌曲或编舞允许跨集合，`split_group_id` 不再强制同组同 split。
-- 参考与执行动作分别为 `retarget_reference` 和 `tracker_executed`，后者关联参考 ID。
-  50Hz 第 i 个保存状态在 `(i+1)/50`；SLERP 回30Hz后排除 t=0 初始化，保留真实源起点。
+MERT采用5秒分块，输出最后一层float16特征；每块重新建立上下文。
+时间戳为卷积感受野中心，不能当作30Hz动作帧。
+音频与动作匹配按原始片段身份建立，未独立校准的时间偏移标为estimated。
+执行标签从t=1/30秒起，发布记录和音频链接都保存这个偏移。
 
-每条轨迹关联独立质量报告。representation/arm-twist/tracking 检查的适用范围明确，
-通过不代表完整物理或语义质量合格。Neutral SMPL 需显式 opt-in；
-AIST scale、Y-up→Z-up、首帧水平平移和整段常量地面高度处理不随重构改变。
+回放视频保留在工作输出目录。移动结果或人工检查时应一起保留该目录。
+人物RGB裁剪和MuJoCo回放是不同功能；当前音频流程不运行人物裁剪。
+当前发布格式尚未接入统一训练loader。
 
-URI 使用根相对路径或 `root://alias/path`；外部 alias 显式写入 external_roots。
-禁止路径穿越及逃逸根目录的 symlink。特征按资产共享，记录输入校验和、encoder checkpoint、
-预处理与提取代码指纹，不按维度推断兼容性。
-
-## 验证与缓存
-
-`validate` 默认检查 metadata、外键、split leakage、文件存在性、Parquet schema/row ranges 和质量报告。
-`--deep-sample N` 额外抽查前 N 个 motion/asset/feature 的数值、SHA256、shape/dtype、时间轴及覆盖。
-该检查不代表原始 WAV/MP4 全量解码或真实 motion 质量评估。
-
-release/package 拒绝覆盖已存在目标，验证后原子发布。AIST stage 缓存键包含原始输入、SMPL模型、
-GMR版本及本地差异、机器人契约、处理代码与配置指纹。失败或改变配置时使用新的 output/work 目录。
-
-bundle 按文件身份复制媒体和特征，改写为相对路径，移动后可读；reference 保留媒体 root aliases，
-不宣称可携带。原始数据、旧成品与模型权重不会被删除或自动重算。
-
-## 人物裁剪
+## 检查
 
 ```bash
-msc-data crop-video --video /path/input.mp4 --output-root /work/crops \
-  --config configs/data_pipeline/person_video.yaml --device cpu
-msc-data validate-video --directory /work/crops/input --decode
-```
-
-先配置真实本地 YOLO 权重。相对权重路径以 YAML 目录为基准。
-输出 `person.mp4`（512×512）、`metadata.npz`（真实源PTS、采样索引、裁剪框、正逆仿射）、
-检测缓存和质量报告；不生成调试预览或机器人回放。多人场景可传 `--track-id`。
-
-## 回归测试
-
-```bash
+python -m data_pipeline.cli validate --dataset <output>/release --deep-sample 20
+python -m data_pipeline.cli package --dataset <output>/release --out <bundle> --mode bundle
 python -m pytest data_pipeline/tests tests -q -m 'not integration and not slow'
 ```
-
-测试目录中的 fixture 覆盖 Text/Audio/Video/Combined、多演员/相机、75Hz 时间偏移、
-tracker 初始化排除和 bundle 移动读取。Synthetic features 不是 MERT 或真实视频编码结果。
-本机真实 OMG 90帧样本已验证。SMPL Male 已下载并校验，配置指向
-`model/smpl/SMPL_MALE.pkl`。

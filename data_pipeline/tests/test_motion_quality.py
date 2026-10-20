@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from data_pipeline.stages.motion_quality import MotionScreeningConfig, resample_motion_at_times, screen_executed_motion
+from data_pipeline.motion.quality import MotionScreeningConfig, resample_motion_at_times, screen_executed_motion
 
 
 def states(n):
@@ -48,7 +48,7 @@ def test_poststep_timestamps_require_initial_state_and_slerp_handles_sign():
         resample_motion_at_times(q, [0, 0, .04], [0])
 
 
-from data_pipeline.stages.motion import validate_qpos, execute_and_screen
+from data_pipeline.motion.tracking import validate_qpos, execute_and_screen
 from data_pipeline.io import write_json
 from data_pipeline.video.media import nearest_frames
 
@@ -67,7 +67,7 @@ def test_invalid_motion_quaternion():
 
 
 def test_execution_cache_preserves_quality_and_creates_video(tmp_path, monkeypatch):
-    from data_pipeline.stages import execution_video
+    from data_pipeline.video import execution as execution_video
     calls = []
     monkeypatch.setattr(execution_video, 'save_execution_video',
                         lambda rollout: calls.append(rollout) or tmp_path / 'execution.mp4')

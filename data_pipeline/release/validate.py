@@ -5,9 +5,9 @@ from collections import Counter
 from pathlib import Path
 import numpy as np
 
-from data_pipeline.schemas import Inventory, TimeMap
-from data_pipeline.schemas.manifest import resolve_uri
-from data_pipeline.stages.motion import validate_qpos
+from data_pipeline.schema import Inventory, TimeMap
+from data_pipeline.io import resolve_uri
+from data_pipeline.motion.tracking import validate_qpos
 
 
 def validate_release(root, deep_sample=0):

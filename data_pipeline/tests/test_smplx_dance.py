@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from data_pipeline.sources.smplx_dance import rotation_6d_to_matrix
+from data_pipeline.sources.audio.finedance.motion import rotation_6d_to_matrix
 
 
 def test_finedance_6d_uses_first_two_rows():

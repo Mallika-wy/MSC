@@ -1,5 +1,5 @@
 # Source-independent component. Weights relative to this YAML directory.
-weights: ../../models/person_detection/yolo11n.pt
+weights: ../../model/person_detection/yolo11n.pt
 device: cpu
 output_size: 512             # Training contract; other sizes are rejected.
 fps: 30.0

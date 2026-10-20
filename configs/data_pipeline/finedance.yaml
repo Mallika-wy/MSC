@@ -1,0 +1,19 @@
+# Paths are relative to this YAML. All durable models live under MSC/model.
+dataset: finedance
+root: ../../data/raw_audio/FineDance
+output: ../../data/processed/audio/finedance
+retarget:
+  gmr_root: ../../../GMR
+  smpl_model: ../../model/smplx/SMPLX_NEUTRAL.npz
+  gender: neutral
+tracker:
+  onnx: ../../model/holomotion/model.onnx
+  providers: CPUExecutionProvider
+audio:
+  model: ../../model/MERT-v1-95M
+  device: cuda:0
+  chunk_seconds: 5
+quality:
+  strict_joint_limits: false
+  arm_twist:
+    enabled: true

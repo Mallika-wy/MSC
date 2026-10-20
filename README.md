@@ -4,9 +4,10 @@ MSC is a small, independent PyTorch research baseline for multimodal G1 motion g
 
 The package does not import Psi0 or OMG at runtime, download model weights/data, implement video, or provide robot deployment. The included `_omg` files are the minimum source-derived closure needed for the official data adapter, representation and attention; see [THIRD_PARTY.md](THIRD_PARTY.md).
 
-The native data pipeline refactor is documented in [MSC Dataset v1](docs/msc_dataset_v1.md),
-Native releases support
-optional modality assets; frozen audio/video extraction and unified training integration remain pending.
+The [data pipeline guide](docs/msc_dataset_v1.md) covers the shared audio-motion pipeline for
+AIST++, FineDance and GDance: GMR, MuJoCo execution videos, MERT features and native release export.
+Start with `data_pipeline/pipeline.py`; each source dataset has its own folder.
+OMG text ingestion is removed. Video feature extraction and unified training integration remain pending.
 
 ## Install
 

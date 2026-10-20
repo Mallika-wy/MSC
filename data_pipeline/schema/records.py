@@ -1,6 +1,5 @@
 """MSC v1 typed entities. Times are seconds; intervals are half open."""
 from dataclasses import dataclass, field
-import math
 
 REPRESENTATION = 'g1_qpos36_wxyz_zup_radians'
 
@@ -99,24 +98,3 @@ class FeatureRecord:
 
 TABLES = {'sequences': SequenceRecord, 'motions': MotionRecord, 'assets': AssetRecord,
           'links': ModalityLink, 'annotations': TextAnnotation, 'features': FeatureRecord}
-
-
-@dataclass
-class SourceMotion:
-    source_motion_id: str
-    sequence_id: str
-    uri: str
-    format: str
-    fps: float
-    actor_id: str = 'actor0'
-    member: str = ''
-    time_origin_sec: float = 0.
-    metadata: dict = field(default_factory=dict)
-
-    def __post_init__(self):
-        if not all(isinstance(v, str) and v.strip() for v in (self.source_motion_id, self.sequence_id, self.uri, self.format, self.actor_id)):
-            raise ValueError('Source motion requires explicit identity, URI, format and actor')
-        if not math.isfinite(self.fps) or self.fps <= 0 or not math.isfinite(self.time_origin_sec):
-            raise ValueError('Invalid source motion timeline')
-        if not isinstance(self.metadata, dict):
-            raise ValueError('Source motion metadata must be a dict')

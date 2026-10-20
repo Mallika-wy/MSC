@@ -6,7 +6,7 @@ import tempfile
 
 import numpy as np
 
-from data_pipeline.schemas import (Inventory, SequenceRecord, MotionRecord, AssetRecord,
+from data_pipeline.schema import (Inventory, SequenceRecord, MotionRecord, AssetRecord,
                                   ModalityLink, TextAnnotation, FeatureRecord)
 from data_pipeline.release.export import export_release
 from data_pipeline.release.package import package_release

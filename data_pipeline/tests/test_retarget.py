@@ -2,13 +2,14 @@ import numpy as np
 import pytest
 
 from data_pipeline.robot import G1_JOINT_NAMES
-from data_pipeline.stages.retarget import HumanMotion, run_gmr
+from data_pipeline.motion.decoding import HumanMotion
+from data_pipeline.motion.retarget import run_gmr
 
 
 @pytest.mark.parametrize('gmr_source', ['smplx', 'bvh_lafan1'])
 def test_shared_gmr_stage_preserves_frames_and_jump_height(monkeypatch, gmr_source):
     import mujoco
-    import data_pipeline.stages.retarget as stage
+    import data_pipeline.motion.retarget as stage
     calls, options = [], []
 
     class Solver:
@@ -41,7 +42,7 @@ def test_shared_gmr_stage_preserves_frames_and_jump_height(monkeypatch, gmr_sour
 
 
 def test_invalid_human_timing_is_rejected_before_loading_gmr(monkeypatch):
-    import data_pipeline.stages.retarget as stage
+    import data_pipeline.motion.retarget as stage
     monkeypatch.setattr(stage, 'load_gmr', lambda _: pytest.fail('Invalid input must fail before GMR loads'))
     motion = HumanMotion(('pelvis',), np.zeros((2, 1, 3)), np.tile([1., 0, 0, 0], (2, 1, 1)),
                          np.array([0., .5]), 1.8, 'smplx')
@@ -55,8 +56,7 @@ def test_aist_decoder_preserves_scale_axes_and_source_times(tmp_path, monkeypatc
     import sys
     from types import SimpleNamespace
     import torch
-    from data_pipeline.sources.aistpp import decode_motion
-    from data_pipeline.schemas.records import SourceMotion
+    from data_pipeline.sources.audio.aistpp.motion import decode_motion
     before_aliases = {name: np.__dict__.get(name) for name in ('bool', 'int', 'float', 'complex', 'object', 'unicode', 'str')}
     before_argspec = getattr(inspect, 'getargspec', None)
 
@@ -75,8 +75,7 @@ def test_aist_decoder_preserves_scale_axes_and_source_times(tmp_path, monkeypatc
     path = tmp_path / 'source.pkl'
     path.write_bytes(pickle.dumps({'smpl_poses': np.zeros((3, 72)), 'smpl_trans': np.array([[2.,0,0],[3.,0,0],[4.,0,0]]),
                                   'smpl_scaling': 2.}))
-    source = SourceMotion('test:smpl', 'test:one', 'source.pkl', 'aist_smpl', 60.)
-    motion = decode_motion(source, path, {'smpl_model': '/mock/model.pkl', 'gender': 'male'})
+    motion = decode_motion(path, {'smpl_model': '/mock/model.pkl', 'gender': 'male'})
     np.testing.assert_allclose(motion.timestamps, [0., 1/30])
     np.testing.assert_allclose(motion.positions[:, 0, :], [[0.,0.,0.], [1.,0.,0.]], atol=1e-7)
     np.testing.assert_allclose(motion.positions[:, 1, 2], .1, atol=1e-7)  # Y-up became Z-up.
@@ -84,3 +83,35 @@ def test_aist_decoder_preserves_scale_axes_and_source_times(tmp_path, monkeypatc
     assert motion.positions.shape == (2, 24, 3)
     assert {name: np.__dict__.get(name) for name in before_aliases} == before_aliases
     assert getattr(inspect, 'getargspec', None) is before_argspec
+
+
+def test_retarget_reuses_matching_source_and_invalidates_changed_input(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from data_pipeline.motion import retarget
+    from data_pipeline.sources.sample import Sample
+    raw, model = tmp_path / 'motion.npy', tmp_path / 'smpl.npz'
+    raw.write_bytes(b'first source')
+    model.write_bytes(b'model fingerprint')
+    sample = Sample('one', 'one', raw, tmp_path / 'audio.wav')
+    human = HumanMotion(('pelvis',), np.zeros((2, 1, 3)),
+                        np.tile([1., 0, 0, 0], (2, 1, 1)), np.arange(2)/30, 1.8, 'smplx')
+    calls = []
+    def decode(*args):
+        return human
+    def solve(*args):
+        calls.append(1)
+        qpos = np.zeros((2, 36), dtype=np.float32)
+        qpos[:, 3] = 1
+        return qpos, {}
+    def git(args, **kwargs):
+        return 'f' * 40 if 'rev-parse' in args else b''
+    monkeypatch.setattr(retarget, 'load_dataset', lambda _: SimpleNamespace(decode_motion=decode))
+    monkeypatch.setattr(retarget, 'run_gmr', solve)
+    monkeypatch.setattr(retarget.subprocess, 'check_output', git)
+    settings = dict(smpl_model=str(model), gmr_root=str(tmp_path))
+    first = retarget.retarget(sample, 'finedance', settings, tmp_path / 'cache')
+    second = retarget.retarget(sample, 'finedance', settings, tmp_path / 'cache')
+    assert first == second and len(calls) == 1
+    raw.write_bytes(b'changed source')
+    changed = retarget.retarget(sample, 'finedance', settings, tmp_path / 'cache')
+    assert changed[1] != first[1] and len(calls) == 2

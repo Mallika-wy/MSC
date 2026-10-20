@@ -1,1 +1,1 @@
-"""Source discovery; never imports a heavy processing backend."""
+"""Raw datasets grouped by modality, with one folder per dataset."""

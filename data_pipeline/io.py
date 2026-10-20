@@ -1,8 +1,9 @@
-"""原子 JSON 与流式文件指纹工具。"""
+"""JSON读写、流式文件指纹，以及显式外部根目录的路径解析。"""
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 from tempfile import NamedTemporaryFile
 
 
@@ -32,3 +33,25 @@ def sha256_file(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def resolve_uri(root, uri, external_roots=None):
+    if not isinstance(uri, str) or not uri or '\\' in uri or '%' in uri or '\x00' in uri:
+        raise ValueError(f'Unsafe URI: {uri!r}')
+    parsed = urlsplit(uri)
+    if parsed.query or parsed.fragment or (parsed.netloc and not parsed.scheme):
+        raise ValueError('URI query/fragment not supported')
+    base = Path(root).resolve()
+    relative = uri
+    if parsed.scheme:
+        if parsed.scheme != 'root' or parsed.netloc not in (external_roots or {}):
+            raise ValueError(f'Unknown external root: {uri}')
+        base = Path(external_roots[parsed.netloc]).expanduser().resolve()
+        relative = parsed.path.removeprefix('/')
+    path = PurePosixPath(relative)
+    if path.is_absolute() or '..' in path.parts or not path.parts or relative in ('.', ''):
+        raise ValueError(f'Unsafe URI: {uri}')
+    target = (base / relative).resolve()
+    if not target.is_relative_to(base):
+        raise ValueError(f'URI escapes root: {uri}')
+    return target

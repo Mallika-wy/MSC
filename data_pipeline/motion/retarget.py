@@ -1,6 +1,5 @@
 """Shared GMR→G1 stage; dataset adapters only decode human motion."""
 import contextlib
-from dataclasses import dataclass, field
 import hashlib
 import importlib
 import inspect
@@ -11,29 +10,11 @@ import sys
 
 import numpy as np
 
-from data_pipeline.schemas.manifest import resolve_uri
+from data_pipeline.sources.audio import load_dataset
 
 from data_pipeline.io import sha256_file, write_json
 from data_pipeline.robot import G1_JOINT_NAMES
-
-# Register a decoder per source format; every decoder feeds the same GMR solver.
-HUMAN_DECODERS = {
-    'aist_smpl': ('data_pipeline.sources.aistpp', 'decode_motion'),
-    'finedance_smplx': ('data_pipeline.sources.smplx_dance', 'decode_motion'),
-    'gdance_smpl': ('data_pipeline.sources.smplx_dance', 'decode_motion'),
-}
-
-
-@dataclass
-class HumanMotion:
-    """GMR input: world-space positions in metres, orientations in wxyz, seconds."""
-    joint_names: tuple[str, ...]
-    positions: np.ndarray
-    orientations: np.ndarray
-    timestamps: np.ndarray
-    height_m: float
-    gmr_source: str
-    provenance: dict = field(default_factory=dict)
+from .decoding import HumanMotion
 
 
 def load_gmr(gmr_root):
@@ -55,7 +36,7 @@ def load_gmr(gmr_root):
 
 def run_gmr(motion: HumanMotion, settings):
     """Shared by SMPL, SMPL-X, BVH or other decoders producing HumanMotion."""
-    from .motion import validate_qpos
+    from .tracking import validate_qpos
     t, j = len(motion.timestamps), len(motion.joint_names)
     if (t < 2 or j == 0 or len(set(motion.joint_names)) != j
             or motion.positions.shape != (t, j, 3) or motion.orientations.shape != (t, j, 4)
@@ -99,13 +80,10 @@ def run_gmr(motion: HumanMotion, settings):
     return qpos, {'ground_constant_shift_m': z_shift, 'joint_limit_max_violation_rad': float(violation.max())}
 
 
-def retarget(source, inventory, inventory_root, settings, work):
-    """Decode a declared source format, then use the shared GMR→G1 stage."""
-    if source.format not in HUMAN_DECODERS:
-        raise ValueError(f'No human-motion decoder for {source.format}')
-    module, name = HUMAN_DECODERS[source.format]
-    decoder = getattr(importlib.import_module(module), name)
-    path = resolve_uri(inventory_root, source.uri, inventory.external_roots)
+def retarget(sample, dataset, settings, work):
+    """Decode one person's motion, then fit the common G1 robot with GMR."""
+    decoder = load_dataset(dataset).decode_motion
+    path = sample.motion
     model = Path(settings['smpl_model']).resolve() if settings.get('smpl_model') else None
     gmr_root = Path(settings['gmr_root']).resolve()
     revision = subprocess.check_output(['git', '-C', str(gmr_root), 'rev-parse', 'HEAD'], text=True).strip()
@@ -118,23 +96,24 @@ def retarget(source, inventory, inventory_root, settings, work):
         if raw_name and name.suffix in ('.py', '.json', '.yaml', '.yml', '.toml'):
             extra_code[raw_name] = sha256_file(gmr_root / name)
     from data_pipeline.robot import robot_contract
-    fingerprint = {'robot': robot_contract(), 'source_sha256': sha256_file(path), 'member': source.member,
+    fingerprint = {'robot': robot_contract(), 'source_sha256': sha256_file(path), 'sample': sample.name, 'actor': sample.actor,
                    'smpl_sha256': sha256_file(model) if model else None, 'gmr_revision': revision,
                    'gmr_worktree_diff_sha256': hashlib.sha256(diff).hexdigest(), 'gmr_untracked_code': extra_code,
                    'stage_sha256': sha256_file(__file__), 'decoder_sha256': sha256_file(inspect.getfile(decoder)),
+                   'human_fk_sha256': sha256_file(Path(__file__).parent / 'decoding.py'),
                    'settings': settings,
-                   'source_time_origin_sec': source.time_origin_sec}
+                   'dataset': dataset}
     key = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
     output = Path(work) / key
     reference = output / 'motion.npz'
     if not reference.is_file() or not (output / 'fingerprint.json').is_file():
         output.mkdir(parents=True, exist_ok=True)
-        motion = decoder(source, path, settings)
+        motion = decoder(path, settings)
         with (output / 'gmr.log').open('w') as log, contextlib.redirect_stdout(log):
             qpos, quality = run_gmr(motion, settings)
         np.savez_compressed(reference, qpos_36=qpos, fps=np.float32(30), source_timestamps=motion.timestamps,
                             joint_names=np.asarray(G1_JOINT_NAMES))
         write_json(output / 'report.json', {**motion.provenance, **quality,
-                   'source_motion_id': source.source_motion_id, 'production_ready': False})
+                   'source_motion_id': sample.name, 'production_ready': False})
         write_json(output / 'fingerprint.json', fingerprint)
     return reference, f'gmr:{key}', fingerprint

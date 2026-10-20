@@ -7,8 +7,8 @@ import shutil
 import tempfile
 
 from data_pipeline.io import sha256_file
-from data_pipeline.schemas import Inventory
-from data_pipeline.schemas.manifest import resolve_uri
+from data_pipeline.schema import Inventory
+from data_pipeline.io import resolve_uri
 from .validate import validate_release
 
 

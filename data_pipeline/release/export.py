@@ -8,9 +8,9 @@ import tempfile
 
 import numpy as np
 
-from data_pipeline.schemas import Inventory
-from data_pipeline.schemas.manifest import resolve_uri
-from data_pipeline.stages.motion import validate_qpos
+from data_pipeline.schema import Inventory
+from data_pipeline.io import resolve_uri
+from data_pipeline.motion.tracking import validate_qpos
 
 
 def canonical_qpos(qpos):
@@ -28,7 +28,7 @@ def canonical_qpos(qpos):
 
 
 def export_release(inventory: Inventory, tracks: dict, output):
-    """tracks maps motion_id to qpos; quality files must already be referenced.
+    """tracks maps motion_id to an array or NPZ path; quality reports are explicit.
 
     Publish atomically into a new directory. Inputs and previous releases are untouched.
     """
@@ -47,7 +47,11 @@ def export_release(inventory: Inventory, tracks: dict, output):
         (temp / 'reports').mkdir()
         motions = []
         for i, m in enumerate(inventory.motions):
-            qpos = canonical_qpos(tracks[m.motion_id])
+            payload = tracks[m.motion_id]
+            if isinstance(payload, (str, Path)):
+                with np.load(payload, allow_pickle=False) as data:
+                    payload = data['qpos_36'].copy()
+            qpos = canonical_qpos(payload)
             times = np.arange(len(qpos), dtype=np.float64) / 30
             validate_qpos(qpos, times)
             if len(qpos) != m.num_frames:
