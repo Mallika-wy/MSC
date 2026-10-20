@@ -1,1 +1,1 @@
-"""独立于训练代码的视频/动作数据流水线，允许接入不同来源的数据集。"""
+"""Offline MSC source discovery, motion processing and native release tools."""

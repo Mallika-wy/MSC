@@ -1,0 +1,5 @@
+# Paths are relative to this YAML. Discover the source first (see docs).
+inventory: ../../.runs/omg-v1-inventory
+output: ../../.runs/omg-v1-release
+tracker:
+  enabled: false

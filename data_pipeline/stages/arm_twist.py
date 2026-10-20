@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from omg.robots.g1.constants import G1_JOINT_NAMES
+from data_pipeline.robot import G1_JOINT_NAMES, G1_URDF
 
 
 RULE_VERSION = 'g1_same_arm_twist_expanded_v2'
@@ -32,7 +32,7 @@ class ArmTwistConfig:
 @lru_cache(maxsize=1)
 def g1_joint_limits():
     """读取拟合指标所用的G1 URDF限位，不用人类肘腕范围代替机器人限位。"""
-    path = Path(__file__).resolve().parents[2] / 'assets/robots/g1/g1_29dof.urdf'
+    path = G1_URDF
     joints = {joint.attrib['name']: joint for joint in ET.parse(path).getroot().findall('joint')}
     lower = np.array([float(joints[name].find('limit').attrib['lower']) for name in G1_JOINT_NAMES])
     upper = np.array([float(joints[name].find('limit').attrib['upper']) for name in G1_JOINT_NAMES])

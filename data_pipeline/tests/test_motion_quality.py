@@ -46,3 +46,37 @@ def test_poststep_timestamps_require_initial_state_and_slerp_handles_sign():
         resample_motion_at_times(q[1:], [.02, .04], [0])
     with pytest.raises(ValueError, match='strictly increase'):
         resample_motion_at_times(q, [0, 0, .04], [0])
+
+
+from data_pipeline.stages.motion import validate_qpos, execute_and_screen
+from data_pipeline.io import write_json
+from data_pipeline.video.media import nearest_frames
+
+
+def test_nearest_frames_uses_pts_not_every_second_frame():
+    pts = np.array([0, .019, .037, .05, .071])
+    np.testing.assert_array_equal(nearest_frames(pts, np.array([0, 1/30, 2/30])), [0, 2, 4])
+    with pytest.raises(ValueError, match='coverage'):
+        nearest_frames(pts, np.array([.1]))
+
+
+
+def test_invalid_motion_quaternion():
+    with pytest.raises(ValueError, match='quaternion'):
+        validate_qpos(np.zeros((2, 36)), np.array([0, 1/30]))
+
+
+def test_execution_cache_preserves_quality_and_creates_video(tmp_path, monkeypatch):
+    from data_pipeline.stages import execution_video
+    calls = []
+    monkeypatch.setattr(execution_video, 'save_execution_video',
+                        lambda rollout: calls.append(rollout) or tmp_path / 'execution.mp4')
+    (tmp_path / 'paired_motion.npz').touch()
+    path = tmp_path / 'quality.json'
+    quality = {'accepted': False, 'rejection_reasons': ['persistent_fall']}
+    write_json(path, quality)
+    before = path.read_bytes()
+    result = execute_and_screen(None, {}, tmp_path)
+    assert result == {**quality, 'execution_video': str(tmp_path / 'execution.mp4')}
+    assert calls == [tmp_path / 'tracker_rollout.npz']
+    assert path.read_bytes() == before

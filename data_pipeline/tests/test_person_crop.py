@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from data_pipeline.components.person_video.geometry import interpolate_boxes, plan_crops
+from data_pipeline.video.geometry import interpolate_boxes, plan_crops
 
 
 def test_short_gap_and_no_long_bridging():

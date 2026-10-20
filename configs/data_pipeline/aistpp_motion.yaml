@@ -1,0 +1,19 @@
+# Local EDGE/AIST++ single-sequence smoke; downloaded SMPL Male model.
+inventory: ../../data/inventory/aistpp-demo
+output: ../../data/processed/aistpp-edge/release
+work: ../../data/processed/aistpp-edge/stages
+retarget:
+  gmr_root: ../../../GMR
+  smpl_model: ../../model/smpl/SMPL_MALE.pkl
+  gender: male
+tracker:
+  enabled: false
+  # To opt in: enabled: true, version: <controller git revision>, onnx: /path/to/motion_tracking/model.onnx
+  providers: CPUExecutionProvider
+quality:
+  strict_joint_limits: false
+  arm_twist:
+    enabled: true
+# Assign selected source sequences explicitly; shared music/choreography is unrestricted.
+split_assignments:
+  'aistpp:gBR_sBM_cAll_d04_mBR0_ch01': train

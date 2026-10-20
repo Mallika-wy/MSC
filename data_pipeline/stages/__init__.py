@@ -1,1 +1,1 @@
-"""流水线处理阶段：动作解码、重定向、执行验证及视频时间轴对齐。"""
+"""Motion decoding, retargeting, execution and quality checks."""

@@ -1,16 +1,10 @@
-"""动作分支：原生格式 → G1参考动作 → 仿真实际执行动作 → 30Hz训练标签。
-
-reference 是重定向器希望机器人达到的姿态；executed 才是控制器实际执行后的姿态。
-两者不能混为一谈，最终标签保留 executed，并记录其有效时间范围。
-"""
+"""G1 decoding, numerical validation and optional tracker execution."""
 from pathlib import Path
-import subprocess
-import sys
 
 import numpy as np
 
-from data_pipeline.core.io import read_json, write_json
-from data_pipeline.core.pairs import Pair
+from data_pipeline.io import read_json, write_json
+from data_pipeline.schemas.manifest import resolve_uri
 
 
 def validate_qpos(qpos, times):
@@ -26,68 +20,61 @@ def validate_qpos(qpos, times):
         raise ValueError('Root quaternion must be unit wxyz')
 
 
-def decode_aist(pair, config, output, project):
-    """读取 CSV 指定的 AIST SMPL，交给已有 GMR 后端生成30Hz参考动作。"""
-    backend = config['retarget']
-    if pair.motion_fps != 60:
-        raise ValueError('aist_smpl requires 60 Hz annotations')
-    # 后端在子进程中运行，隔离旧SMPL/chumpy依赖；调试时可启用 subProcess。
-    # CSV 同时提供真实视频路径、ZIP路径和member，不在调度器里猜文件位置。
-    args = [sys.executable, '-m', 'data_pipeline.backends.aist_smpl_gmr',
-            '--sequence', pair.sequence_id, '--source-root', pair.source_root or str(Path(pair.motion_path).parent.parent),
-            '--motion-path', pair.motion_path, '--motion-member', pair.motion_member,
-            '--video-path', pair.video_path, '--gmr-root', backend['gmr_root'],
-            '--smpl-model', backend['smpl_model'], '--gender', backend['gender'],
-            '--output', str(output), '--skip-video', '--overwrite']
-    if backend.get('dependency_site'):
-        args += ['--dependency-site', backend['dependency_site']]
-    if backend.get('allow_nonofficial_model'):
-        args.append('--allow-nonofficial-model')
-    with (output.parent / 'retarget.log').open('w') as log:
-        subprocess.run(args, cwd=project, stdout=log, stderr=subprocess.STDOUT, check=True)
-    if pair.motion_time_offset_s:
-        # 只移动时间轴，不删首帧、不改变动作速度，用于与公共序列时间对齐。
-        with np.load(output / 'motion.npz', allow_pickle=False) as data:
-            payload = dict(data)
-        payload['source_timestamps'] += pair.motion_time_offset_s
-        np.savez_compressed(output / 'motion.npz', **payload)
+def read_global_rows(directory, start, length):
+    import pyarrow.parquet as pq
+    if type(start) is not int or type(length) is not int or start < 0 or length < 2:
+        raise ValueError('Invalid source row range')
+    remaining, offset, pieces, timestamps = length, 0, [], []
+    for path in sorted(Path(directory).glob('chunk-*/*.parquet')):
+        file = pq.ParquetFile(path)
+        for group in range(file.num_row_groups):
+            count = file.metadata.row_group(group).num_rows
+            if remaining and offset + count > start:
+                lo = max(0, start - offset)
+                take = min(count - lo, remaining)
+                data = file.read_row_group(group, columns=['observation.state', 'timestamp']).slice(lo, take)
+                pieces.append(np.asarray(data['observation.state'].to_pylist(), dtype=np.float32))
+                timestamps.append(data['timestamp'].to_numpy().astype(np.float64))
+                remaining -= take
+                start += take
+            offset += count
+            if not remaining:
+                qpos = np.concatenate(pieces)
+                return qpos, np.concatenate(timestamps)
+    raise ValueError('Source row range exceeds local parquet files')
 
 
-def decode_g1(pair, config, output, project):
-    """已是规范G1的NPZ无需人体重定向，但仍需检查格式和后续执行质量。"""
-    # 此格式名明确承诺：官方29关节顺序、米制、Z向上、根四元数wxyz。
-    if pair.motion_fps != 30 or pair.motion_member:
-        raise ValueError('g1_qpos_wxyz requires a normal 30 Hz NPZ file')
-    with np.load(pair.motion_path, allow_pickle=False) as data:
-        qpos, times = data['qpos_36'].astype(np.float32), data['timestamps'].astype(np.float64)
-    times += pair.motion_time_offset_s
+def decode(source, inventory, inventory_root):
+    path = resolve_uri(inventory_root, source.uri, inventory.external_roots)
+    if source.fps != 30:
+        raise ValueError('Native G1 requires 30 Hz; use an explicit retarget/resampling stage')
+    if source.format == 'omg_lerobot_g1':
+        qpos, times = read_global_rows(path, source.metadata['row_start'], source.metadata['num_frames'])
+    elif source.format == 'g1_qpos_wxyz':
+        with np.load(path, allow_pickle=False) as data:
+            qpos = data['qpos_36'].astype(np.float32)
+            times = data['timestamps'].astype(np.float64)
+
+    else:
+        raise ValueError(f'No native decoder for {source.format}; retarget is required')
     validate_qpos(qpos, times)
-    np.savez_compressed(output / 'motion.npz', qpos_36=qpos, source_timestamps=times,
-                        source_frame_indices=np.arange(len(qpos)), fps=np.float32(30))
+    # Legacy LeRobot timestamp columns may be float32; tolerate quantization, not a missing frame.
+    if not np.allclose(times, times[0] + np.arange(len(times))/30, atol=1e-5, rtol=0):
+        raise ValueError('Nonuniform native G1 timeline')
+    return qpos, times
 
 
-# 新动作格式只在这里注册对应解码器；不同数据源若格式相同，可以共用解码器。
-DECODERS = {'aist_smpl': decode_aist, 'g1_qpos_wxyz': decode_g1}
+def resample_executed(reference, executed, *, control_fps=50., motion_fps=30.):
+    from .motion_quality import resample_motion_at_times
+    if control_fps != 50 or motion_fps != 30:
+        raise ValueError('Current AIST controller contract is 50 Hz execution and 30 Hz labels')
+    query = np.arange(len(reference), dtype=np.float64) / motion_fps
+    source_times = np.arange(len(executed) + 1, dtype=np.float64) / control_fps
+    aligned = resample_motion_at_times(np.concatenate((reference[:1], executed)), source_times, query)
+    return aligned, query > 0
 
 
-def prepare_reference(pair: Pair, config, directory, project, force=False):
-    """选择解码器并获得统一参考动作；已有文件可复用，force=True 时重算。"""
-    decoder = DECODERS.get(pair.motion_format)
-    if decoder is None:
-        raise ValueError(f'Unsupported motion_format: {pair.motion_format}; add a decoder')
-    output = directory / 'reference'
-    output.mkdir(exist_ok=True)
-    path = output / 'motion.npz'
-    if force or not path.is_file():
-        decoder(pair, config, output, project)
-    with np.load(path, allow_pickle=False) as data:
-        validate_qpos(data['qpos_36'], data['source_timestamps'])
-        if float(data['fps']) != 30 or not np.allclose(np.diff(data['source_timestamps']), 1/30, atol=1e-7):
-            raise ValueError('Reference must be uniformly sampled at 30 Hz')
-    return path
-
-
-def execute_and_screen(reference, config, output, project, force=False):
+def execute_and_screen(reference, config, output):
     """执行参考轨迹、检查原始控制频率下的质量，再按标签时间重采样。
 
     输出 paired_motion.npz：qpos_36、公共时间戳、30Hz帧率、执行有效性掩码。
@@ -95,24 +82,23 @@ def execute_and_screen(reference, config, output, project, force=False):
     """
     motion_path = output / 'paired_motion.npz'
     quality_path = output / 'quality.json'
+    rollout = output / 'tracker_rollout.npz'
+    from data_pipeline.stages.execution_video import save_execution_video
 
-    if not force and motion_path.is_file() and quality_path.is_file():
-        return read_json(quality_path)
+    if motion_path.is_file() and quality_path.is_file():
+        video = save_execution_video(rollout)
+        quality = read_json(quality_path)
+        quality['execution_video'] = str(video.resolve())
+        return quality
 
-    return _execute_motion(reference, config, output, force=force)
-
-
-def _execute_motion(reference, config, output, force=False):
-    """实际执行与质检；仅在缓存未命中时加载仿真依赖。"""
     import mujoco
     import torch
 
     from data_pipeline.stages.motion_quality import (
         MotionScreeningConfig,
-        resample_motion_at_times,
         screen_executed_motion,
     )
-    from omg.robots.g1.kinematics import G1Kinematics
+    from msc._omg.kinematics import G1Kinematics
     from omg.tracking.holomotion.reference import resample_qpos
     from omg.tracking.holomotion.runner import (
         TrackerRunConfig,
@@ -125,8 +111,7 @@ def _execute_motion(reference, config, output, force=False):
         ref = data['qpos_36'].copy()
         source_times = data['source_timestamps'].copy()
 
-    rollout = output / 'tracker_rollout.npz'
-    if force or not rollout.is_file():
+    if not rollout.is_file():
         # 控制器50Hz执行；每次控制包含10个物理子步，这不是最终标签帧率。
         tracker_config = TrackerRunConfig(
             reference=reference,
@@ -138,6 +123,9 @@ def _execute_motion(reference, config, output, force=False):
             output=rollout,
         )
         run_holomotion_tracker(tracker_config)
+
+    # Save every physical rollout, including those later rejected by screening.
+    save_execution_video(rollout)
 
     with np.load(rollout, allow_pickle=False) as data:
         executed = data['executed_qpos_36'].copy()
@@ -152,7 +140,7 @@ def _execute_motion(reference, config, output, force=False):
         or executed.shape != tracked_ref.shape
         or not np.array_equal(tracked_ref, resample_qpos(ref, 30, fps))
     ):
-        raise ValueError('Rollout does not match reference/timing; rerun with --force')
+        raise ValueError('Rollout does not match reference/timing; use a new work directory')
 
     kinematics = G1Kinematics()
     policy = config.get('quality', {})
@@ -174,11 +162,7 @@ def _execute_motion(reference, config, output, force=False):
 
     # 第i个保存的执行状态发生在(i+1)*dt，而不是i*dt；否则会错位20ms。
     # 显式补上t=0初始化状态方便插值，但最后的掩码会排除它，不当作执行标签。
-    aligned = resample_motion_at_times(
-        np.concatenate((ref[:1], executed)),
-        np.arange(len(executed) + 1) * dt,
-        np.arange(len(ref)) / 30,
-    )
+    aligned, executed_mask = resample_executed(ref, executed, control_fps=fps)
     with torch.no_grad():
         # 通过同一套G1正向运动学比较全局身体位置，而不只比较关节角。
         body = kinematics.forward_kinematics(torch.from_numpy(aligned))['body_pos_w'].numpy()
@@ -201,13 +185,14 @@ def _execute_motion(reference, config, output, force=False):
         'rejection_reasons': reasons,
         'screening': screening,
         'tracking': metrics,
+        'execution_video': str((output / 'execution.mp4').resolve()),
         'production_ready': False,
     }
     np.savez_compressed(
         output / 'paired_motion.npz',
         qpos_36=aligned,
         timestamps=source_times,
-        executed_state_mask=np.arange(len(ref)) > 0,
+        executed_state_mask=executed_mask,
         fps=np.float32(30),
     )
     write_json(output / 'quality.json', quality)

@@ -4,11 +4,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from data_pipeline.components.person_video import PersonVideoConfig, preprocess_person_video, validate_person_video
-from data_pipeline.components.person_video.geometry import crop_affines
-from data_pipeline.components.person_video.processor import select_track
-from data_pipeline.stages.video import prepare_video_view
-from data_pipeline.core.pairs import Pair
+from data_pipeline.video import PersonVideoConfig, preprocess_person_video, validate_person_video
+from data_pipeline.video.geometry import crop_affines
+from data_pipeline.video.processor import select_track
 
 
 def test_training_size_is_a_hard_contract():
@@ -49,7 +47,7 @@ def test_tracks_are_not_merged_by_framewise_largest_box():
 @pytest.fixture
 def synthetic_video(tmp_path, monkeypatch):
     import cv2
-    import data_pipeline.components.person_video.processor as processor
+    import data_pipeline.video.processor as processor
     raw = tmp_path / 'raw'
     raw.mkdir()
     video, weights = raw / 'input.mp4', tmp_path / 'test_weights.pt'
@@ -97,23 +95,9 @@ def test_real_encoding_cache_and_crop_only_invalidation(synthetic_video):
         validate_person_video(Path(first['directory']))
 
 
-def test_pairing_uses_exact_label_grid_and_retains_coordinate_mapping(synthetic_video):
-    video, component, root, _ = synthetic_video
-    source = Pair('fixture', 'one', 'front', str(video), component.weights, 'g1_qpos_wxyz',
-                  camera_path='/original/camera.json', video_time_offset_s=2.0)
-    times = 2 + np.arange(8) / 30
-    settings = {'video_preprocess': {'enabled': True, 'weights': component.weights, 'fps': 30}}
-    view = prepare_video_view(source, times, settings, root)
-    assert view['metadata']['width'] == view['metadata']['height'] == 512
-    assert view['frame_indices'] == list(range(8))
-    np.testing.assert_allclose(np.array(view['frame_pts_s']) + view['sequence_time_offset_s'], times)
-    assert view['source_calibration_uri'] == source.camera_path
-    assert Path(view['crop_metadata_uri']).is_file()
-
-
 def test_decoder_thread_limit_preserves_pixels_and_duplicate_frames(synthetic_video):
     import cv2
-    from data_pipeline.components.person_video.media import selected_frames
+    from data_pipeline.video.media import selected_frames
     video, *_ = synthetic_video
     capture = cv2.VideoCapture(str(video))
     original = []
@@ -133,7 +117,7 @@ def test_decoder_thread_limit_preserves_pixels_and_duplicate_frames(synthetic_vi
 def test_yolo_weight_reuse_and_per_video_tracker_reset(monkeypatch):
     import sys
     from types import SimpleNamespace
-    from data_pipeline.components.person_video.detection import load_model, reset_tracks
+    from data_pipeline.video.detection import load_model, reset_tracks
     loads, resets = [], []
 
     def fake_yolo(weights):
@@ -155,3 +139,15 @@ def test_yolo_weight_reuse_and_per_video_tracker_reset(monkeypatch):
         reset_tracks(SimpleNamespace(predictor=None))  # 尚未推理时无需重置。
     finally:
         load_model.cache_clear()
+
+
+def test_requested_pts_and_crop_timeline_are_retained(synthetic_video):
+    video, config, root, _ = synthetic_video
+    requested = np.arange(2, 7) / 30
+    result = preprocess_person_video(video, root, config, requested)
+    with np.load(result['metadata'], allow_pickle=False) as data:
+        np.testing.assert_allclose(data['source_requested_pts'], requested)
+        np.testing.assert_allclose(data['output_timestamps'], np.arange(5)/30)
+        assert data['original_to_crop_affine'].shape == (5, 2, 3)
+        assert data['crop_to_original_affine'].shape == (5, 2, 3)
+    assert validate_person_video(root, decode=True)['frames'] == 5
