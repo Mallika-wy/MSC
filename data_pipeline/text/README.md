@@ -1,2 +1,1 @@
-文本处理暂不启用。后续下载每个原始文本动作数据集后，在 `sources/text/<数据集>/` 增加读取器，
-这里放共用文本处理逻辑。旧 OMG 汇总文本读取器与构建配置已经移除。
+文本以 SourceText 描述，ReleaseBuilder 将其裁剪到对应动作时间区间并写入 annotations.parquet。当前不提取 T5 特征。

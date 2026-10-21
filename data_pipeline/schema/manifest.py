@@ -47,19 +47,29 @@ class Inventory:
                 for r in rows:
                     r['source_provenance'] = json.dumps(r['source_provenance'], sort_keys=True)
             pq.write_table(pa.Table.from_pylist(rows, schema=arrow_schema(cls)), root / 'meta' / f'{name}.parquet', compression='zstd')
+        self.write_manifest(root, release=release)
+        return root
+
+    def write_manifest(self, root, *, release=False):
+        root = Path(root)
+        (root / 'meta').mkdir(parents=True, exist_ok=True)
         (root / 'meta/provenance.json').write_text(json.dumps(self.provenance, indent=2, ensure_ascii=False))
         from data_pipeline.robot import robot_contract
-        manifest = dict(schema_version='1.0', kind='release' if release else 'inventory', target_motion_fps=30.,
+        manifest = dict(package_mode=self.provenance.get('package_mode', 'reference'), features_bundled=self.provenance.get('portable', False), quality_storage='parquet_by_motion_id_v1' if all(m.quality_ref.endswith('.parquet') for m in self.motions) else 'json_by_motion_id_v1', feature_storage=self.provenance.get('feature_storage', 'parquet_by_feature_id_v1' if any(f.feature_uri.endswith('.parquet') for f in self.features) else 'npy_v1'), motion_storage='split_shards_v1', schema_version='1.0', kind='release' if release else 'inventory', target_motion_fps=30.,
                         representation=REPRESENTATION, external_roots=self.external_roots,
                         robot=robot_contract())
         (root / 'dataset.json').write_text(json.dumps(manifest, indent=2))
         return root
 
     @classmethod
-    def read(cls, root):
+    def read(cls, root, *, validate=True):
         import pyarrow.parquet as pq
         root = Path(root)
         manifest = json.loads((root / 'dataset.json').read_text())
+        if manifest.get('quality_storage', 'json_by_motion_id_v1') not in ('json_by_motion_id_v1', 'parquet_by_motion_id_v1'):
+            raise ValueError('Unsupported quality storage contract')
+        if manifest.get('feature_storage', 'npy_v1') not in ('npy_v1', 'parquet_by_feature_id_v1'):
+            raise ValueError('Unsupported feature storage contract')
         if manifest.get('kind') not in ('inventory', 'release'):
             raise ValueError('Invalid manifest kind')
         if manifest['schema_version'] != '1.0' or manifest['target_motion_fps'] != 30 or manifest['representation'] != REPRESENTATION:
@@ -77,5 +87,6 @@ class Inventory:
                 for r in rows:
                     r['source_provenance'] = json.loads(r['source_provenance'])
             tables[name] = [record_type(**r) for r in rows]
-        return cls(**tables, external_roots=manifest['external_roots'],
-                   provenance=json.loads((root / 'meta/provenance.json').read_text())).validate(root, release=manifest['kind'] == 'release')
+        inventory = cls(**tables, external_roots=manifest['external_roots'],
+                        provenance=json.loads((root / 'meta/provenance.json').read_text()))
+        return inventory.validate(root, release=manifest['kind'] == 'release') if validate else inventory

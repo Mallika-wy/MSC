@@ -18,6 +18,8 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
     for (name, cls), key in zip(TABLES.items(), id_fields):
         records = getattr(inventory, name)
         ids[name] = {}
+        hints = get_type_hints(cls)
+        record_fields = fields(cls)
         for r in records:
             if not isinstance(r, cls):
                 raise ValueError(f'{name}: expected {cls.__name__}')
@@ -25,8 +27,7 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
             if not isinstance(identity, str) or not identity.strip() or identity in ids[name]:
                 raise ValueError(f'Duplicate or empty {key}: {identity}')
             ids[name][identity] = r
-            hints = get_type_hints(cls)
-            for f in fields(r):
+            for f in record_fields:
                 value = getattr(r, f.name)
                 hint = hints[f.name]
                 options = get_args(hint) if get_origin(hint) is types.UnionType else (hint,)
@@ -51,10 +52,14 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
         if key not in ids[table]:
             raise ValueError(f'Missing foreign key {table}: {key}')
         return ids[table][key]
+    checked_uris = set()
     def uri(value):
+        if value in checked_uris:
+            return
         p = resolve_uri(root, value, inventory.external_roots)
         if check_files and not p.is_file():
             raise ValueError(f'Missing file: {p}')
+        checked_uris.add(value)
     sources = {}
     for s in inventory.sequences:
         if not all((s.source_dataset, s.source_sequence_id, s.split_group_id, s.source_provenance)):

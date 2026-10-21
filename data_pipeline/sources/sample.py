@@ -8,12 +8,12 @@ class Sample:
     name: str
     sequence: str
     motion: Path
-    audio: Path
+    audio: Path | None
     split: str = 'train'
     actor: str = 'actor0'
 
-    def validate(self):
-        for path in (self.motion, self.audio):
-            if not path.is_file():
+    def validate(self, *, require_audio=True):
+        for path in ((self.motion, self.audio) if require_audio else (self.motion,)):
+            if path is None or not path.is_file():
                 raise FileNotFoundError(path)
         return self

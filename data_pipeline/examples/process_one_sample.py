@@ -8,13 +8,13 @@ from data_pipeline.pipeline import run
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('dataset', choices=['aistpp', 'finedance', 'gdance'])
+    parser.add_argument('dataset', choices=['aistpp', 'finedance', 'gdance', 'omg'])
     parser.add_argument('--sequence')
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
 
     project = Path(__file__).resolve().parents[2]
-    config_name = 'aistpp_motion.yaml' if args.dataset == 'aistpp' else f'{args.dataset}.yaml'
+    config_name = {'aistpp': 'aistpp_motion.yaml', 'omg': 'omg_text.yaml'}.get(args.dataset, f'{args.dataset}.yaml')
     config = project / 'configs/data_pipeline' / config_name
     result = run(config, limit=1, sequence=args.sequence, output=args.output)
     print(json.dumps(result, indent=2))

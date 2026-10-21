@@ -1,4 +1,4 @@
-"""Exercise orchestration and real publication without loading neural models."""
+"""Exercise independent orchestration and real publication without neural models."""
 from pathlib import Path
 import wave
 
@@ -20,37 +20,44 @@ def make_wav(path):
         stream.writeframes(b'\0' * 48000)
 
 
+def legacy_config(tmp_path, names=('accepted', 'rejected', 'broken')):
+    raw = tmp_path / 'raw'
+    (raw / 'motions').mkdir(parents=True)
+    for name in names:
+        (raw / 'motions' / f'{name}.pkl').write_bytes(name.encode())
+        make_wav(raw / 'wavs' / f'{name}.wav')
+    (tmp_path / 'tracker.onnx').write_bytes(b'synthetic-controller')
+    config = tmp_path / 'config.yaml'
+    config.write_text(yaml.safe_dump(dict(dataset='aistpp', root='raw', output='processed',
+        retarget=dict(gmr_root='gmr', smpl_model='smpl.pkl'), tracker=dict(onnx='tracker.onnx'),
+        audio=dict(model='mert'))))
+    return config
+
+
 @pytest.mark.parametrize('diagnostic', [False, True])
 def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_path, monkeypatch, diagnostic):
     from data_pipeline.motion import retarget, tracking, arm_twist
     from data_pipeline.audio import cache
-    raw = tmp_path / 'raw'
-    (raw / 'motions').mkdir(parents=True)
-    for name in ('accepted', 'rejected', 'broken'):
-        (raw / 'motions' / f'{name}.pkl').touch()
-        make_wav(raw / 'wavs' / f'{name}.wav')
-    onnx = tmp_path / 'tracker.onnx'
-    onnx.write_bytes(b'synthetic-controller')
-    config = tmp_path / 'config.yaml'
-    config.write_text(yaml.safe_dump(dict(
-        dataset='aistpp', root='raw', output='processed',
-        retarget=dict(gmr_root='gmr', smpl_model='smpl.pkl'),
-        tracker=dict(onnx='tracker.onnx'), audio=dict(model='mert'))))
+    from data_pipeline.processors import motion
+    config = legacy_config(tmp_path)
     qpos = np.zeros((6, 36), dtype=np.float32)
     qpos[:, 0] = np.arange(6) / 30
     qpos[:, 2:4] = [.8, 1.]
-
     def solve(sample, dataset, settings, output):
         if sample.name == 'broken':
             raise ValueError('broken source')
-        output.mkdir(parents=True)
+        output.mkdir(parents=True, exist_ok=True)
         reference = output / 'motion.npz'
         np.savez(reference, qpos_36=qpos, source_timestamps=np.arange(6)/30)
         return reference, 'synthetic-gmr', {}
-
+    # Source identity is explicit, not inferred from temporary output names.
+    original_process = motion.process_motion
+    current = []
+    def process(source, *args, **kwargs):
+        current[:] = [source.motion_id]
+        return original_process(source, *args, **kwargs)
     def screen(reference, policy):
-        return {'accepted': 'rejected' not in str(reference), 'rejection_reasons': []}
-
+        return {'accepted': current[0] != 'rejected', 'rejection_reasons': []}
     calls = []
     def execute(reference, version, execution, quality, controller, output):
         calls.append(reference)
@@ -58,25 +65,23 @@ def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_
         paired = output / 'paired_motion.npz'
         np.savez(paired, qpos_36=qpos, executed_state_mask=np.arange(6)>0)
         return dict(accepted=True, path=str(paired), version=controller)
-
     class Encoder:
-        def __init__(self, *args, **kwargs):
-            pass
+        def __init__(self, *args, **kwargs): pass
         def extract(self, wav, output):
             from data_pipeline.io import sha256_file
-            output.mkdir(exist_ok=True)
-            np.save(output / 'values.npy', np.zeros((75, 768), dtype=np.float16))
-            np.save(output / 'times.npy', np.arange(75, dtype=np.float64)/75)
+            from data_pipeline.storage.store import Store
+            arrays = Store(output / 'features.sqlite').put('fake', {},
+                values=np.zeros((75,768), dtype=np.float16), timestamps=np.arange(75,dtype=np.float64)/75)
             return dict(encoder='synthetic', checkpoint_hash='synthetic', preprocess_hash='synthetic',
-                        input_checksum=sha256_file(wav), shape=[75, 768],
-                        values=str(output/'values.npy'), timestamps=str(output/'times.npy'))
-
+                        input_checksum=sha256_file(wav), shape=[75,768], arrays=arrays)
+    monkeypatch.setattr(motion, 'environment_key', lambda *a: 'test')
+    monkeypatch.setattr(motion, 'process_motion', process)
     monkeypatch.setattr(retarget, 'retarget', solve)
     monkeypatch.setattr(arm_twist, 'screen_reference', screen)
     monkeypatch.setattr(tracking, 'track', execute)
     monkeypatch.setattr(cache, 'AudioCache', Encoder)
     summary = run(config, diagnostic=diagnostic)
-    assert (summary['accepted'], summary['rejected'], summary['errors']) == (1, 1, 1)
+    assert (summary['accepted'], summary['rejected'], summary['errors']) == (1,1,1)
     assert len(calls) == (2 if diagnostic else 1)
     release = tmp_path / 'processed/release'
     inventory = Inventory.read(release)
@@ -88,19 +93,50 @@ def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_
     link = next(l for l in inventory.links if l.motion_id == executed.motion_id)
     assert link.time_offset_sec == pytest.approx(1/30)
     assert link.alignment_status == 'estimated'
-    assert (tmp_path / 'processed/samples/broken/error.json').is_file()
+    from data_pipeline.storage.store import Store
+    rows = list(Store(tmp_path / 'processed/work/results.sqlite').results())
+    assert rows[1]['motions'][0]['error'] == 'broken source'
+    assert not (tmp_path / 'processed/samples').exists()
+    assert ref.storage_uri == executed.storage_uri
+    assert executed.row_start == ref.num_frames
 
 
 def test_dry_run_lists_real_pairs_without_creating_output(tmp_path):
-    (tmp_path / 'raw/motion').mkdir(parents=True)
-    (tmp_path / 'raw/motion/001.npy').touch()
-    make_wav(tmp_path / 'raw/music_wav/001.wav')
-    config = tmp_path / 'config.yaml'
-    config.write_text(yaml.safe_dump(dict(
-        dataset='finedance', root='raw', output='processed',
-        retarget=dict(gmr_root='missing', smpl_model='missing'),
-        tracker=dict(onnx='missing'), audio=dict(model='missing'))))
+    config = legacy_config(tmp_path, ['one'])
     assert run(config, dry_run=True)['count'] == 1
     assert not (tmp_path / 'processed').exists()
     with pytest.raises(ValueError, match='No matching'):
         run(config, sequence='missing', dry_run=True)
+
+
+def _parallel_fake_sequence(source):
+    import time
+    time.sleep(.05 if source.sequence_id == 'accepted' else .01)
+    name = source.sequence_id
+    from data_pipeline.pipeline import _record
+    return dict(name=name, sequence=_record(source), motions=[], assets=[], state='error' if name=='broken' else name)
+
+
+def _parallel_fake_init(*args):
+    from data_pipeline import pipeline
+    pipeline._worker_process = _parallel_fake_sequence
+
+
+def test_spawn_workers_keep_errors_and_stable_publication_order(tmp_path, monkeypatch):
+    from data_pipeline import pipeline
+    config = legacy_config(tmp_path)
+    monkeypatch.setattr(pipeline, '_init_worker', _parallel_fake_init)
+    published = []
+    def publish(work, output, config):
+        from data_pipeline.storage.store import Store
+        published.extend(Store(work / 'results.sqlite').results())
+    monkeypatch.setattr(pipeline, 'publish_work', publish)
+    summary = pipeline.run(config, workers=2, diagnostic=True)
+    assert (summary['accepted'], summary['rejected'], summary['errors']) == (1,1,1)
+    assert [r['name'] for r in published] == ['accepted','broken','rejected']
+
+
+@pytest.mark.parametrize('workers', [0,-1,True,1.5])
+def test_invalid_worker_count(workers):
+    with pytest.raises(ValueError, match='workers'):
+        run('/not/read.yaml', workers=workers)

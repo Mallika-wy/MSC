@@ -1,19 +1,38 @@
-# Paths are relative to this YAML. All durable models live under MSC/model.
-dataset: finedance
-root: ../../data/raw_audio/FineDance
-output: ../../data/processed/audio/finedance
-retarget:
-  gmr_root: ../../../GMR
-  smpl_model: ../../model/smplx/SMPLX_NEUTRAL.npz
-  gender: neutral
-tracker:
-  onnx: ../../model/holomotion/model.onnx
-  providers: CPUExecutionProvider
+# Paths are relative to this YAML. No models are downloaded.
+source:
+  dataset: finedance
+  root: ../../data/raw_audio/FineDance
+motion:
+  target_fps: 30
+  representation: g1_qpos36
+  retarget:
+    enabled: auto
+    gmr_root: ../../../GMR
+    smpl_model: ../../model/smplx/SMPLX_NEUTRAL.npz
+    gender: neutral
+  tracking:
+    enabled: true
+    onnx: ../../model/holomotion/model.onnx
+    providers: CPUExecutionProvider
 audio:
+  enabled: true
   model: ../../model/MERT-v1-95M
   device: cuda:0
   chunk_seconds: 5
+video:
+  enabled: false
+text:
+  enabled: false
 quality:
   strict_joint_limits: false
   arm_twist:
     enabled: true
+release:
+  output: ../../data/processed/audio/finedance
+  publish_labels:
+  - retarget_reference
+  - tracker_executed
+  train_default: tracker_executed
+  max_shard_frames: 1000000
+  split_policy: preserve
+  alignment_policy: allow_estimated

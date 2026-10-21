@@ -1,143 +1,165 @@
-# 数据处理入口与阅读顺序
+# MSC 数据处理与共享分片发布
 
-当前处理 AIST++、FineDance、AIOZ-GDance 的音频—动作对。OMG 汇总文本入口已移除；
-后续文本原始数据集分别放到 `sources/text/<dataset>/`。
+主流程为 `SourceSequence → Independent Processors → Artifacts / Alignment → ReleaseBuilder`。
+支持 AIST++、FineDance、AIOZ-GDance 和本机清洗后的 OMG Motion+Text。
+本轮只负责预处理和发布；`src/msc/data/` 的统一训练加载器尚未接入此 Release。
+现有官方 OMG 训练适配器仍要求其固定官方版本，不能直接用于本地清洗版本。
 
-## 从这几个文件开始
+## 模块与配置
 
-1. `cli.py`：解析命令，调用 pipeline。
-2. `config.py`：读取 YAML，将路径解析为绝对路径。
-3. `pipeline.py`：逐条组织 GMR、质检、tracker/视频、MERT 和导出。
-4. `sources/audio/<dataset>/dataset.py`：找动作与配对 WAV。
-5. `sources/audio/<dataset>/motion.py`：解码该数据集的人体动作。
-6. `motion/retarget.py`、`motion/tracking.py`：共用 GMR 与 OMG tracker。
+- `sources/<dataset>/` 负责发现、身份、原始时间关系和解码；旧 `sources/audio/` 导入保留兼容。
+- `sources/base.py` 定义 SourceSequence、SourceMotion、SourceAsset、SourceText、SourceAlignment。
+- `processors/` 提供独立的动作、音频和人物视频处理函数；不引入 DAG 或插件框架。
+- `storage/` 保存带指纹的数组 Artifact，以及增量工作记录。
+- `release/builder.py` 统一组装六张表；`release/export.py` 增量写出共享分片并原子发布。
 
-新数据集只需提供 `samples(root)` 和 `decode_motion(path, settings)`，
-并在 `sources/audio/__init__.py` 的数据集名单注册。
+配置采用 `source / motion / audio / video / text / quality / release`。
+已有旧式 YAML 在读取时转换为同一 Settings，禁止混合新旧顶层字段。
+所有配置路径相对于 YAML；只解析启用阶段所需的模型路径，不自动下载任何数据或模型。
 
-## 目录职责
-
-| 目录/文件 | 负责什么 |
-|---|---|
-| `sources/audio/aistpp/` | AIST++ SMPL 60Hz → 人体关节 30Hz |
-| `sources/audio/finedance/` | FineDance 315D、52个关节的6D旋转；按矩阵行解码 |
-| `sources/audio/gdance/` | 读取拆分人物的索引、SMPL参数和共享音频；含拆分脚本 |
-| `motion/decoding.py` | SMPL-X前向运动学及Y-up → Z-up转换 |
-| `motion/retarget.py` | 人体关节 → 共用GMR → G1参考动作；处理缓存 |
-| `motion/tracking.py` | 50Hz MuJoCo执行、执行缓存、30Hz标签 |
-| `motion/arm_twist.py` | 参考动作的手臂扭转启发式检查 |
-| `motion/quality.py` | 执行动作的跌倒、限位检查与时间重采样 |
-| `audio/mert.py` | WAV预处理与MERT编码，只返回数组与时间戳 |
-| `audio/cache.py` | 特征指纹、去重、保存和复用；共享音乐只编码一次 |
-| `video/execution.py` | 实际执行状态的MuJoCo回放，保存每条已执行动作的视频 |
-| `video/processor.py` | 独立的原始人物RGB视频裁剪入口 |
-| `video/detection.py`、`geometry.py`、`media.py`、`config.py` | 人物检测、裁剪几何、视频读写、参数 |
-| `schema/records.py` | 六类发布记录。保留文本字段以兼容格式，当前流程不生成文本 |
-| `schema/manifest.py` | 元信息与Parquet表的读写 |
-| `schema/validation.py` | 字段、引用、时间覆盖和数据契约检查 |
-| `schema/time_map.py` | 动作与模态时间映射 |
-| `release/audio.py` | 将合格样本转换为发布记录 |
-| `release/export.py`、`validate.py`、`package.py` | 正式导出、检查和搬运打包 |
-| `io.py`、`robot.py` | JSON、指纹、路径解析和G1关节约定 |
-| `examples/process_one_sample.py` | 调试单条样本，调用同一个pipeline |
-
-FineDance原始数据是SMPL-H；FineDance和GDance目前均使用中性SMPL-X人体近似。
-G1动作统一为36维：根位置3 + 根四元数wxyz 4 + 关节角29，单位米/弧度，Z向上。
-
-## 运行
-
-本机使用 `.venv-gmr`，继承已有GMR依赖，并在该环境安装MERT依赖与本地OMG包。
-代码不再把其他项目的site-packages插入sys.path。新环境需安装MSC的pipeline依赖、
-GMR依赖及本地OMG tracker包。
-
-在MSC根目录：
-
-```bash
-export PYTHONNOUSERSITE=1
-export PYTHONPATH="$PWD:$PWD/src"
-export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM=egl
-export OMP_NUM_THREADS=4
-export LP_NUM_THREADS=4
-
-# 只看即将处理的配对，不加载模型，不产生输出
-.venv-gmr/bin/python -s -m data_pipeline.cli run \
-  --config configs/data_pipeline/aistpp_motion.yaml --limit 3 --dry-run
-
-# 三个数据集分别运行一条；去掉--limit可处理全量
-.venv-gmr/bin/python -s -m data_pipeline.cli run \
-  --config configs/data_pipeline/aistpp_motion.yaml --limit 1
-.venv-gmr/bin/python -s -m data_pipeline.cli run \
-  --config configs/data_pipeline/finedance.yaml --limit 1
-.venv-gmr/bin/python -s -m data_pipeline.cli run \
-  --config configs/data_pipeline/gdance.yaml --limit 1
-
-# 和批处理完全共用逻辑的调试示例
-.venv-gmr/bin/python -s -m data_pipeline.examples.process_one_sample finedance \
-  --output data/processed/debug/finedance
+```yaml
+source:
+  dataset: omg
+  root: ../../../OMG/data/OMG-Data
+motion:
+  target_fps: 30
+  representation: g1_qpos36
+  retarget: {enabled: auto}
+  tracking: {enabled: false}
+audio: {enabled: false}
+video: {enabled: false}
+text: {enabled: true}
+release:
+  output: ../../data/processed/omg-text
+  publish_labels: [source_g1]
+  train_default: source_g1
+  max_shard_frames: 1000000
+  split_policy: preserve
+  alignment_policy: allow_estimated
 ```
 
-`--sequence` 可选单个样本或GDance组；`--output` 可指定新的输出目录。
-`--diagnostic` 允许执行未通过参考质检的动作供人工检查，仍不发布失败样本。
-一条数据报错会写出error.json，继续下一条；命令最终在有错误时返回非零状态。
+OMG 读取当前 `meta/info.json`、episode 元数据和 `observation.state[36]`，不使用下一帧参考 `action`。
+保留原始 episode 编号、上游来源、split 和清洗报告校验和；不要求未经修改的官方 manifest 哈希。
+读取会校验 episode 身份、全局索引、局部帧号、30 FPS 时间戳和 qpos 数值。
+原生 G1 默认跳过 GMR 和 Tracker，不重复执行已经完成的历史质量删除。
+这条路径的 Artifact 直接引用源分片行范围和内容校验和，不重复缓存动作数组；重新发布时验证源文件未改变。
+人体动作默认使用现有 GMR 和参考质检；Tracker 可选。FineDance/GDance 的 SMPL-X 近似不变。
 
-GDance需要先有单人索引。本机已拆好，重做时：
+`publish_labels` 与 `train_default` 分离；发布 tracker_executed 必须同时发布其参考父动作。
+执行标签去掉初始化帧，从源时间 `1/30` 秒开始；资产映射和文本区间同时修正。
 
-```bash
-.venv-gmr/bin/python -s -m data_pipeline.cli split-gdance \
-  --root data/raw_audio/AIOZ-GDance \
-  --output data/processed/AIOZ-GDance-single-person
-```
-
-## 输出和恢复
-
-原始数据在 `data/raw_audio/`，模型在 `model/`，结果在 `data/processed/audio/<dataset>/`。
+## 目录与文件数量
 
 ```text
 output/
-  config.json
-  progress.json
-  summary.json
-  samples/<sample>/
-    status.json
-    error.json                     # 该样本报错时产生
-    reference/<fingerprint>/       # GMR参考动作和报告
-    tracking/<fingerprint>/
-      tracker_rollout.npz           # 真实50Hz执行状态
-      paired_motion.npz             # 对齐到30Hz，首帧初始化状态无效
-      labels.npz                   # 发布时排除初始化帧
-      quality.json
-      execution.mp4                # 512×512、50Hz，包含质检拒绝的执行
-  audio/<fingerprint>/
-    values.npy
-    times.npy
-    features.json
-  release/                         # 只包含通过参考与执行质检的样本
-    dataset.json
-    meta/
-    motion/
-    reports/
+├── config.json
+├── summary.json
+├── cache/
+│   ├── motion.sqlite               # NPZ 数组包作为数据库记录，非逐动作文件
+│   ├── audio/features.sqlite       # 共享音频的 MERT 特征和时间戳
+│   └── prepared/features-*/audio/shard-*.parquet
+├── work/
+│   ├── results.sqlite              # 按发现顺序索引的序列/演员结果、QC、错误和 traceback
+│   ├── progress.json               # 有界频率更新的统计
+│   └── diagnostics/                # 仅 --diagnostic 时保存详细中间文件/回放
+└── release/
+    ├── dataset.json
+    ├── meta/
+    │   ├── sequences.parquet
+    │   ├── motions.parquet
+    │   ├── assets.parquet
+    │   ├── links.parquet
+    │   ├── annotations.parquet
+    │   ├── features.parquet
+    │   └── provenance.json
+    ├── motion/
+    │   ├── train/shard-00000.parquet
+    │   ├── val/shard-00000.parquet
+    │   └── test/shard-00000.parquet
+    ├── reports/
+    │   ├── quality-00000.parquet
+    │   └── dataset_summary.json
+    └── features/                   # bundle 时包含
+        ├── audio/shard-*.parquet
+        └── video/shard-*.parquet
 ```
 
-失败后可对同一输出目录重试，已有指纹匹配的计算会复用。
-成功发布后，重跑请使用新的 `--output`；不会覆盖已有release。
-发布按条读取动作，不一次把全部动作放进内存。
-AIST++和FineDance默认train；GDance保留官方train/val/test。共享歌曲或编舞不限制跨集合。
-同一GDance片段的演员共享同一音频资源和特征。
+只有实际存在的 split/模态才创建目录。默认每个动作分片最多一百万帧，在动作边界切换；
+单条超长动作独占一个分片。多条短动作共同组成 row group，避免每条动作一个 row group。
+`motions.storage_uri + row_start + num_frames` 精确定位动作；每条动作时间从零开始。
+G1 统一为根位置 xyz、根四元数 wxyz 和 29 个关节角，共 36 维，单位米/弧度，Z 向上。
 
-MERT采用5秒分块，输出最后一层float16特征；每块重新建立上下文。
-时间戳为卷积感受野中心，不能当作30Hz动作帧。
-音频与动作匹配按原始片段身份建立，未独立校准的时间偏移标为estimated。
-执行标签从t=1/30秒起，发布记录和音频链接都保存这个偏移。
+QC 每行包含 `motion_id / accepted / report_json`。`quality_ref` 引用共享 Parquet，按 motion_id 查询。
+旧式 JSON QC 仍可读取。新布局通过 manifest 的 `quality_storage`、`motion_storage` 显式标记，六表列不变。
+不合格动作与错误记录仅留在 work；发布报告汇总处理数量及拒绝原因。
 
-回放视频保留在工作输出目录。移动结果或人工检查时应一起保留该目录。
-人物RGB裁剪和MuJoCo回放是不同功能；当前音频流程不运行人物裁剪。
-当前发布格式尚未接入统一训练loader。
+特征每行包含 `feature_id / shape / dtype / values / timestamps / timestamp_shape`，
+按 feature_id 读取，`feature_uri` 和 `timestamp_uri` 指向同一共享文件。
+默认每个特征分片最多约 256 MiB 数组数据，单个超大资产可独占。
+`release.features.read_feature` 同时支持旧 NPY 与新 Parquet 特征。
+manifest 用 `feature_storage`、`package_mode`、`features_bundled` 标记特征布局与打包方式。
 
-## 检查
+缓存采用 SQLite 事务完成标记、内容校验和和固定数量的文件锁，进程退出后锁自动释放。
+不同资产共享内容和处理配置时复用同一记录；换 MERT 不影响动作缓存，改 Tracker 不重算 GMR。
+正常运行不会留下逐动作 NPZ、JSON 或视频。重型运动学组件使用临时工作目录，结束后清理。
+显式启用的人物视频裁剪按唯一视频/人物/配置保存媒体和空间时间映射；这类媒体缓存仍按视频保存，
+不会因为同一视频关联多个动作而复制。
+
+发布按序列增量写元数据和动作；并发任务数有界。最终验证仍需在内存中建立元数据引用索引，
+但不会一次载入全部动作或特征数组。所有发布都验证完整元数据和 QC，默认深检前 32 条负载；
+可用 validate 命令扩大深检范围。
+
+## 运行与恢复
+
+在 MSC 根目录，使用已安装相应依赖的 Python；本机 GMR/Tracker 使用 `.venv-gmr`。
 
 ```bash
-python -m data_pipeline.cli validate --dataset <output>/release --deep-sample 20
+python -m data_pipeline.cli run --config configs/data_pipeline/omg_text.yaml --limit 10 --dry-run
+python -m data_pipeline.cli run --config configs/data_pipeline/omg_text.yaml --limit 10
+python -m data_pipeline.cli run --config configs/data_pipeline/aistpp_motion.yaml --workers 2
+python -m data_pipeline.cli run --config configs/data_pipeline/gdance.yaml --sequence <group-id>
+python -m data_pipeline.cli validate --dataset <output>/release --deep-sample 100
+python -m data_pipeline.cli publish --work <output>/work --out <new-release>
 python -m data_pipeline.cli package --dataset <output>/release --out <bundle> --mode bundle
-python -m pytest data_pipeline/tests tests -q -m 'not integration and not slow'
+```
+
+`--limit` 按序列计数；GDance 一条序列包含多名演员，共享音频只编码一次。
+`--workers` 使用 spawn，完成顺序不影响发布顺序。演员失败单独记录，其他合格演员仍可发布。
+`--diagnostic` 可执行被参考质检拒绝的动作供检查，但不会发布该动作。
+处理错误或演员错误使 CLI 返回非零状态；普通质检拒绝保留统计。
+
+中断后重跑同一未发布输出会复用内容和配置匹配的缓存，并重新建立当前运行 ledger。
+`publish` 仅读取 ledger 和已有数组，不加载任何处理模型，使用原运行的发布策略。
+普通 Release 的外部特征引用依赖原缓存目录；移动使用 bundle，可整体迁移后验证。
+已有 Release 不会被覆盖。不要在同一 output 上同时启动两个 run/publish；缓存内部允许多 worker 并发。
+
+GDance 首次需要单人索引：
+
+```bash
+python -m data_pipeline.cli split-gdance --root <raw-gdance> --output <single-person-root>
+```
+
+## 对齐、划分和视频扩展
+
+默认 `split_policy: preserve` 保留来源 split，将同源组和共享歌曲跨 split 情况写入 provenance。
+`song_disjoint` 按歌曲内容校验和与来源组的连通分量划分，支持 `split_seed`（默认 0）、
+`split_ratios`（默认 `[0.8, 0.1, 0.1]`），记录来源 split，避免共享歌曲跨集合。
+
+默认 `alignment_policy: allow_estimated` 接受明确标记的 estimated，跳过 unknown；
+`verified_only` 仅发布 verified 关联。所有链接都裁剪到动作与资产的实际交集。
+MERT 保持现有 5 秒分块、最后一层 float16 特征和 token 中心时间，不将其当作动作帧。
+
+现有数据集不根据文件名猜测视频同步。需要视频时，在 `source.asset_manifest` 指定补充 Parquet：
+每行包含 `sequence_id, motion_id, asset_id, path, modality, time_scale, time_offset_sec,
+alignment_status, alignment_source`，可选 `camera_id, track_id`。
+路径相对于该清单；同一视频多演员要使用各自的 asset_id 和 track_id。
+时间映射约定为 `asset_time = motion_time * time_scale + time_offset_sec`。
+视频裁剪后自动扣除裁剪结果对应的原视频时间原点；不自动提升对齐可信度。
+启用视频却没有声明视频资产会明确报错。本轮仅裁剪视频，不提取 V-JEPA 特征。
+
+## 测试
+
+```bash
+.venv/bin/python -m pytest data_pipeline/tests -q
+.venv/bin/python -m pytest tests -q -m 'not integration and not slow'
 ```

@@ -29,7 +29,12 @@ def package_release(root, output, *, mode='bundle'):
         source = resolve_uri(root, uri, inv.external_roots)
         if source not in copied:
             digest = sha256_file(source)
-            relative = f'{category}/{digest}{source.suffix}'
+            if category == 'motion' and source.parent.name in ('train', 'val', 'test'):
+                category = f'{category}/{source.parent.name}'
+            if source.is_relative_to(root) and category.split('/')[0] in ('motion', 'reports'):
+                relative = source.relative_to(root).as_posix()
+            else:
+                relative = f'{category}/{digest}{source.suffix}'
             target = temp / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             if not target.exists():
@@ -38,7 +43,23 @@ def package_release(root, output, *, mode='bundle'):
         return copied[source]
     try:
         motions = [replace(m, storage_uri=copy(m.storage_uri, 'motion'), quality_ref=copy(m.quality_ref, 'reports')) for m in inv.motions]
-        features = [replace(f, feature_uri=copy(f.feature_uri, 'features'), timestamp_uri=copy(f.timestamp_uri, 'features')) for f in inv.features]
+        features = []
+        if mode == 'bundle':
+            from .features import FeatureShardWriter, read_feature
+            modalities = {a.asset_id: a.modality for a in inv.assets}
+            writer = FeatureShardWriter(temp / 'features')
+            try:
+                for f in inv.features:
+                    values, times = read_feature(root, f, inv.external_roots)
+                    path = writer.add(modalities[f.asset_id], f.feature_id, values, times)
+                    relative = path.relative_to(temp).as_posix()
+                    features.append(replace(f, feature_uri=relative, timestamp_uri=relative))
+            finally:
+                writer.close()
+        else:
+            def reference(uri):
+                return uri if uri.startswith('root://') else f'root://package_source/{uri}'
+            features = [replace(f, feature_uri=reference(f.feature_uri), timestamp_uri=reference(f.timestamp_uri)) for f in inv.features]
         assets = []
         roots = {} if mode == 'bundle' else dict(inv.external_roots)
         if mode == 'reference':
@@ -51,7 +72,7 @@ def package_release(root, output, *, mode='bundle'):
         packaged = replace(inv, motions=motions, assets=assets, features=features, external_roots=roots,
                            provenance={**inv.provenance, 'package_mode': mode, 'portable': mode == 'bundle'})
         packaged.write(temp, release=True)
-        report = validate_release(temp, deep_sample=max(len(motions), len(features)))
+        report = validate_release(temp, deep_sample=min(32, max(len(motions), len(features))))
         (temp / 'reports').mkdir(exist_ok=True)
         (temp / 'reports/dataset_summary.json').write_text(json.dumps(report, indent=2))
         os.rename(temp, output)

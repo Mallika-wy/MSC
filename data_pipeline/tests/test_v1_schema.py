@@ -116,9 +116,12 @@ def test_deep_check_catches_corrupt_feature_time(tmp_path):
     root = make_fixture(tmp_path / 'release')
     inv = Inventory.read(root)
     times = root / inv.features[0].timestamp_uri
-    values = np.load(times)
-    values[1] = values[0]
-    np.save(times, values)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    table = pq.read_table(times)
+    rows = table.to_pylist()
+    rows[0]['timestamps'][1] = rows[0]['timestamps'][0]
+    pq.write_table(pa.Table.from_pylist(rows, schema=table.schema), times)
     assert validate_release(root)['valid']  # Metadata-only deliberately avoids payload reads.
     with pytest.raises(ValueError, match='strictly increase'):
         validate_release(root, deep_sample=100)

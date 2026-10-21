@@ -10,7 +10,7 @@ import sys
 
 import numpy as np
 
-from data_pipeline.sources.audio import load_dataset
+from data_pipeline.sources import load_dataset
 
 from data_pipeline.io import sha256_file, write_json
 from data_pipeline.robot import G1_JOINT_NAMES

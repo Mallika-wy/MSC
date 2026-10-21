@@ -1,3 +1,2 @@
-"""AIST++: 60 Hz SMPL annotations and matching WAV excerpts."""
-from .dataset import samples
-from .motion import decode_motion
+"""Compatibility imports for the dataset-centric adapter."""
+from data_pipeline.sources.aistpp import *

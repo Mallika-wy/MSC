@@ -21,17 +21,7 @@ def track(reference, reference_version, execution, quality, tracker_version, out
     return {**result, 'path': str((directory / 'paired_motion.npz').resolve()), 'version': tracker_version}
 
 
-def validate_qpos(qpos, times):
-    """检查公共动作契约：qpos[T,36]、时间戳[T]、有限值及单位四元数。
-
-    36维 = 根位置xyz[3] + 根四元数wxyz[4] + G1关节角[29]。
-    """
-    if qpos.ndim != 2 or qpos.shape[1] != 36 or len(qpos) < 2 or times.shape != (len(qpos),):
-        raise ValueError('Expected at least two G1 qpos frames (T,36) and matching timestamps')
-    if not np.isfinite(qpos).all() or not np.isfinite(times).all() or (np.diff(times) <= 0).any():
-        raise ValueError('Invalid motion values or timestamps')
-    if np.max(abs(np.linalg.norm(qpos[:, 3:7], axis=1) - 1)) > 1e-3:
-        raise ValueError('Root quaternion must be unit wxyz')
+from .validation import validate_qpos
 
 
 def resample_executed(reference, executed, *, control_fps=50., motion_fps=30.):
@@ -56,9 +46,10 @@ def execute_and_screen(reference, config, output):
     from data_pipeline.video.execution import save_execution_video
 
     if motion_path.is_file() and quality_path.is_file():
-        video = save_execution_video(rollout)
         quality = read_json(quality_path)
-        quality['execution_video'] = str(video.resolve())
+        if config.get('execution', {}).get('save_video', True):
+            video = save_execution_video(rollout)
+            quality['execution_video'] = str(video.resolve())
         return quality
 
     import mujoco
@@ -95,7 +86,8 @@ def execute_and_screen(reference, config, output):
         run_holomotion_tracker(tracker_config)
 
     # Save every physical rollout, including those later rejected by screening.
-    save_execution_video(rollout)
+    if config.get('execution', {}).get('save_video', True):
+        save_execution_video(rollout)
 
     with np.load(rollout, allow_pickle=False) as data:
         executed = data['executed_qpos_36'].copy()

@@ -7,7 +7,7 @@ The package does not import Psi0 or OMG at runtime, download model weights/data,
 The [data pipeline guide](docs/msc_dataset_v1.md) covers the shared audio-motion pipeline for
 AIST++, FineDance and GDance: GMR, MuJoCo execution videos, MERT features and native release export.
 Start with `data_pipeline/pipeline.py`; each source dataset has its own folder.
-OMG text ingestion is removed. Video feature extraction and unified training integration remain pending.
+The dataset-centric pipeline also imports the locally cleaned OMG text-motion release into shared Parquet shards. Video feature extraction and unified training integration remain pending.
 
 ## Install
 

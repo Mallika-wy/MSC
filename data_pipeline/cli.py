@@ -8,13 +8,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
 
-    run = commands.add_parser('run', help='Process audio/motion pairs through GMR, tracker and MERT')
+    run = commands.add_parser('run', help='Process dataset sequences and publish shared Parquet shards')
     run.add_argument('--config', type=Path, required=True)
     run.add_argument('--limit', type=int)
-    run.add_argument('--sequence', help='Sample ID, or GDance group sequence ID')
+    run.add_argument('--workers', type=int, default=1, help='Independent sample processes (default: 1)')
+    run.add_argument('--sequence', help='Sequence ID or motion ID')
     run.add_argument('--output', type=Path)
     run.add_argument('--dry-run', action='store_true')
     run.add_argument('--diagnostic', action='store_true', help='Execute rejected references for review')
+
+    publish = commands.add_parser('publish', help='Rebuild release from saved artifacts without models')
+    publish.add_argument('--work', type=Path, required=True)
+    publish.add_argument('--out', type=Path, required=True)
 
     split = commands.add_parser('split-gdance', help='Split GDance into individual actors')
     split.add_argument('--root', type=Path, required=True)
@@ -43,9 +48,12 @@ def main():
     if args.command == 'run':
         from data_pipeline.pipeline import run
         result = run(args.config, limit=args.limit, sequence=args.sequence, output=args.output,
-                     dry_run=args.dry_run, diagnostic=args.diagnostic)
+                     dry_run=args.dry_run, diagnostic=args.diagnostic, workers=args.workers)
+    elif args.command == 'publish':
+        from data_pipeline.pipeline import publish_work
+        result = publish_work(args.work, args.out) or {'published': False}
     elif args.command == 'split-gdance':
-        from data_pipeline.sources.audio.gdance.split import split_dataset
+        from data_pipeline.sources.gdance.split import split_dataset
         sequences, actors = split_dataset(args.root, args.output)
         result = dict(sequences=sequences, actors=actors, output=str(args.output))
     elif args.command == 'validate':
@@ -69,7 +77,7 @@ def main():
         from data_pipeline.video import validate_person_video
         result = validate_person_video(args.directory, args.decode)
     print(json.dumps(result, indent=2))
-    if result.get('errors', 0):
+    if result.get('errors', 0) or result.get('motion_errors', 0):
         raise SystemExit(1)
 
 
