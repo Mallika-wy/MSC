@@ -1,27 +1,7 @@
 import numpy as np
 
-from data_pipeline.audio.cache import AudioCache
+from data_pipeline.audio.processor import AudioCache
 from data_pipeline.tests.test_pipeline import make_wav
-
-
-def test_shared_audio_is_encoded_once_and_preprocessing_changes_invalidate_cache(tmp_path, monkeypatch):
-    from data_pipeline.audio.mert import MertEncoder
-    model = tmp_path / 'model'
-    model.mkdir()
-    for name in ('pytorch_model.bin', 'config.json', 'preprocessor_config.json'):
-        (model / name).write_bytes(b'synthetic')
-    wav = tmp_path / 'group.wav'
-    make_wav(wav)
-    calls = []
-    def encode(encoder, path):
-        calls.append(path)
-        return np.zeros((3, 768), dtype=np.float16), np.arange(3, dtype=np.float64)/75, 1.
-    monkeypatch.setattr(MertEncoder, 'encode', encode)
-    first = AudioCache(model).extract(wav, tmp_path / 'features')
-    again = AudioCache(model).extract(wav, tmp_path / 'features')
-    assert first == again and len(calls) == 1
-    changed = AudioCache(model, chunk_seconds=10).extract(wav, tmp_path / 'features')
-    assert changed['values'] != first['values'] and len(calls) == 2
 
 
 def test_mert_chunk_timestamps_keep_the_second_chunks_audio_offset(monkeypatch):
@@ -92,15 +72,15 @@ def test_consolidated_audio_cache_invalidation_and_corruption(tmp_path, monkeypa
         return np.ones((3,8),dtype=np.float16),np.arange(3,dtype=np.float64)/75,1.
     monkeypatch.setattr(MertEncoder,'encode',encode)
     output = tmp_path/'cache'
-    first = AudioCache(model,consolidated=True).extract(wav,output)
-    second = AudioCache(model,consolidated=True).extract(wav,output)
+    first = AudioCache(model).extract(wav,output)
+    second = AudioCache(model).extract(wav,output)
     assert first==second and len(calls)==1
-    changed = AudioCache(model,consolidated=True,chunk_seconds=10).extract(wav,output)
+    changed = AudioCache(model,chunk_seconds=10).extract(wav,output)
     assert changed['arrays']['key'] != first['arrays']['key'] and len(calls)==2
     assert load_arrays(first['arrays'])['values'].shape==(3,8)
     with Store(first['arrays']['store']).connect() as db:
         db.execute('UPDATE artifacts SET payload=? WHERE key=?',(b'incomplete',first['arrays']['key']))
-    again = AudioCache(model,consolidated=True).extract(wav,output)
+    again = AudioCache(model).extract(wav,output)
     assert len(calls)==3 and again==first
     assert len(list(output.glob('*.sqlite')))==1
     assert not list(output.rglob('*.npy'))

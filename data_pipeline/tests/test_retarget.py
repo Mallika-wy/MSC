@@ -56,7 +56,7 @@ def test_aist_decoder_preserves_scale_axes_and_source_times(tmp_path, monkeypatc
     import sys
     from types import SimpleNamespace
     import torch
-    from data_pipeline.sources.audio.aistpp.motion import decode_motion
+    from data_pipeline.sources.aistpp.motion import decode_motion
     before_aliases = {name: np.__dict__.get(name) for name in ('bool', 'int', 'float', 'complex', 'object', 'unicode', 'str')}
     before_argspec = getattr(inspect, 'getargspec', None)
 
@@ -88,11 +88,13 @@ def test_aist_decoder_preserves_scale_axes_and_source_times(tmp_path, monkeypatc
 def test_retarget_reuses_matching_source_and_invalidates_changed_input(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from data_pipeline.motion import retarget
-    from data_pipeline.sources.sample import Sample
+    from data_pipeline.motion import processor
+    from data_pipeline.sources.base import SourceMotion
+    from data_pipeline.config import Settings
     raw, model = tmp_path / 'motion.npy', tmp_path / 'smpl.npz'
     raw.write_bytes(b'first source')
     model.write_bytes(b'model fingerprint')
-    sample = Sample('one', 'one', raw, tmp_path / 'audio.wav')
+    source = SourceMotion('one', raw)
     human = HumanMotion(('pelvis',), np.zeros((2, 1, 3)),
                         np.tile([1., 0, 0, 0], (2, 1, 1)), np.arange(2)/30, 1.8, 'smplx')
     calls = []
@@ -103,15 +105,19 @@ def test_retarget_reuses_matching_source_and_invalidates_changed_input(tmp_path,
         qpos = np.zeros((2, 36), dtype=np.float32)
         qpos[:, 3] = 1
         return qpos, {}
-    def git(args, **kwargs):
-        return 'f' * 40 if 'rev-parse' in args else b''
     monkeypatch.setattr(retarget, 'load_dataset', lambda _: SimpleNamespace(decode_motion=decode))
     monkeypatch.setattr(retarget, 'run_gmr', solve)
-    monkeypatch.setattr(retarget.subprocess, 'check_output', git)
-    settings = dict(smpl_model=str(model), gmr_root=str(tmp_path))
-    first = retarget.retarget(sample, 'finedance', settings, tmp_path / 'cache')
-    second = retarget.retarget(sample, 'finedance', settings, tmp_path / 'cache')
+    monkeypatch.setattr(processor, 'environment_key', lambda *args: 'test-environment')
+    settings = Settings('finedance', tmp_path, tmp_path / 'output',
+        dict(enabled='auto', smpl_model=str(model), gmr_root=str(tmp_path)),
+        dict(enabled=False), dict(enabled=False), dict(arm_twist=dict(enabled=False)))
+    first = processor.process_motion(source, 'finedance', settings)
+    second = processor.process_motion(source, 'finedance', settings)
     assert first == second and len(calls) == 1
+    settings.quality['arm_twist']['wrist_bend_deg'] = 50.
+    processor.process_motion(source, 'finedance', settings)
+    assert len(calls) == 1  # Quality policy changes do not rerun GMR.
     raw.write_bytes(b'changed source')
-    changed = retarget.retarget(sample, 'finedance', settings, tmp_path / 'cache')
-    assert changed[1] != first[1] and len(calls) == 2
+    changed = processor.process_motion(source, 'finedance', settings)
+    assert changed[0].version != first[0].version and len(calls) == 2
+    assert not list(settings.output.rglob('*.npz'))

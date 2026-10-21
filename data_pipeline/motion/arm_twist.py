@@ -6,7 +6,6 @@
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 import math
-from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -109,24 +108,21 @@ def screen_arm_twist(qpos, lengths=None, *, fps=30., joint_order=G1_JOINT_NAMES,
     return [records[k] for k in sorted(records)]
 
 
-def screen_reference(path: Path, policy):
+def screen_reference(qpos, policy, *, fps=30.):
     """重定向结束立刻检查参考动作，命中后不再执行控制器或处理视频。
 
-    每次读取参考缓存重新判断，不依赖历史质检结果，也不加载控制器。
+    直接检查参考数组，不依赖历史质检结果，也不加载控制器。
     """
     options = dict(policy.get('arm_twist', {}))
     enabled = options.pop('enabled', True)
     config = ArmTwistConfig(**options)
     result = {'version': RULE_VERSION, 'enabled': enabled, 'thresholds': asdict(config), 'events': []}
     if enabled:
-        with np.load(path, allow_pickle=False) as data:
-            fps = float(data['fps'])
-            hits = screen_arm_twist(data['qpos_36'], fps=fps, config=config)
-            times = data['source_timestamps']
-            for record in hits:
-                for event in record['events']:
-                    event['sequence_start_s'] = float(times[event['start_frame']])
-                    event['sequence_end_s'] = float(times[event['end_frame']-1]+1/fps)
-            result.update(events=hits, fps=fps)
+        hits = screen_arm_twist(qpos, fps=fps, config=config)
+        for record in hits:
+            for event in record['events']:
+                event['sequence_start_s'] = event['start_frame'] / fps
+                event['sequence_end_s'] = event['end_frame'] / fps
+        result.update(events=hits, fps=fps)
     reasons = ['arm_twist_reference'] if result['events'] else []
     return {'stage': 'retarget', 'accepted': not reasons, 'rejection_reasons': reasons, 'arm_twist': result}

@@ -78,7 +78,7 @@ def test_omg_cleaned_release_all_splits_and_republish_without_models(tmp_path, m
     assert not list((tmp_path/'processed/cache').rglob('*.sqlite'))
     assert inv.motions[1].row_start==5
     assert pq.ParquetFile(root / inv.motions[0].storage_uri).num_row_groups==1
-    from data_pipeline.processors import motion as processor
+    from data_pipeline.motion import processor
     monkeypatch.setattr(processor,'process_motion',lambda *a,**k: pytest.fail('reprocessing'))
     assert publish_work(tmp_path/'processed/work',tmp_path/'republished')['motions']==4
     assert validate_release(tmp_path/'republished',100)['valid']
@@ -126,7 +126,7 @@ def test_transactional_store_corruption_and_recovery(tmp_path):
         load_arrays(ref)
     store.put('one',{},qpos_36=np.zeros((4,36)))
     assert load_arrays(ref)['qpos_36'].sum()==0
-    store.record('later',2,{'name':'later'}); store.record('first',0,{'name':'first'})
+    store.record_many([('later', 2, {'name':'later'}), ('first', 0, {'name':'first'})])
     assert [row['name'] for row in store.results()]==['first','later']
 
 
@@ -166,7 +166,7 @@ def test_config_rejects_mixed_and_missing_parent(tmp_path):
     config,qpos = omg_config(tmp_path)
     values = yaml.safe_load(config.read_text())
     values['dataset']='omg'; config.write_text(yaml.safe_dump(values))
-    with pytest.raises(ValueError,match='mix'):
+    with pytest.raises(ValueError,match='legacy'):
         Settings.read(config)
     del values['dataset']; values['motion']={'tracking':{'enabled':True,'onnx':'tracker'}}
     values['release']['publish_labels']=['tracker_executed']; values['release']['train_default']='tracker_executed'
@@ -179,8 +179,9 @@ def test_generic_builder_combined_modalities_and_failed_actor(tmp_path, monkeypa
     from data_pipeline.sources.base import (SourceSequence, SourceMotion, SourceAsset, SourceText, SourceAlignment)
     from data_pipeline.storage.artifacts import MotionArtifact, FeatureArtifact
     from data_pipeline import pipeline
-    from data_pipeline.processors import motion, audio, video
-    from data_pipeline.audio import cache
+    from data_pipeline.motion import processor as motion
+    from data_pipeline.audio import processor as audio
+    from data_pipeline.video import processor as video
     from data_pipeline.io import sha256_file
     from data_pipeline.tests.test_pipeline import make_wav
     from data_pipeline.release.features import read_feature
@@ -210,7 +211,7 @@ def test_generic_builder_combined_modalities_and_failed_actor(tmp_path, monkeypa
     monkeypatch.setattr(motion,'process_motion',process)
     monkeypatch.setattr(audio,'process_audio',sound)
     monkeypatch.setattr(video,'process_video',lambda *a,**k:dict(video=str(cropped),frames=30,fps=30.,track_id=7,source_time_origin_sec=1.))
-    monkeypatch.setattr(cache,'AudioCache',lambda *a,**k:None)
+    monkeypatch.setattr(audio,'AudioCache',lambda *a,**k:None)
     config = tmp_path/'config.yaml'
     config.write_text(yaml.safe_dump(dict(source={'dataset':'omg','root':'raw'},
         audio={'enabled':True,'model':'missing'},video={'enabled':True,'weights':'missing'},

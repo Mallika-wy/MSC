@@ -51,3 +51,21 @@ class SourceSequence:
     alignments: list[SourceAlignment] = field(default_factory=list)
     split: str = 'train'
     provenance: dict = field(default_factory=dict)
+
+
+def paired_sequence(dataset, sequence_id, pairs, split='train'):
+    """Build a sequence from per-actor motions and optional shared WAV files."""
+    motions, assets, alignments = [], {}, []
+    for motion, audio in pairs:
+        if not motion.path.is_file():
+            raise FileNotFoundError(motion.path)
+        motions.append(motion)
+        if audio is not None:
+            if not audio.is_file():
+                raise FileNotFoundError(audio)
+            identity = str(audio.resolve())
+            assets.setdefault(identity, SourceAsset(identity, audio, 'audio'))
+            alignments.append(SourceAlignment(motion.motion_id, identity))
+    return SourceSequence(sequence_id, dataset, sequence_id, motions,
+                          list(assets.values()), alignments=alignments, split=split,
+                          provenance={'source_sequence': sequence_id})

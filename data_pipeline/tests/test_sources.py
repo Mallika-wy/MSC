@@ -2,8 +2,8 @@
 import numpy as np
 import pickle
 
-from data_pipeline.sources.audio import load_dataset
-from data_pipeline.sources.audio.gdance.split import split_dataset
+from data_pipeline.sources import discover
+from data_pipeline.sources.gdance.split import split_dataset
 from data_pipeline.tests.test_pipeline import make_wav
 
 
@@ -12,10 +12,10 @@ def test_aist_pairs_do_not_depend_on_camera_files(tmp_path):
     (root / 'motions').mkdir(parents=True)
     (root / 'motions/one.pkl').touch()
     make_wav(root / 'wavs/one.wav')
-    samples = list(load_dataset('aistpp').samples(tmp_path))
-    assert len(samples) == 1
-    assert samples[0].name == samples[0].sequence == 'one'
-    assert samples[0].split == 'train'
+    sequences = list(discover('aistpp', tmp_path))
+    assert len(sequences) == 1
+    assert sequences[0].motions[0].motion_id == sequences[0].sequence_id == 'one'
+    assert sequences[0].split == 'train'
 
 
 def test_gdance_split_preserves_each_actor_and_shares_audio(tmp_path):
@@ -31,11 +31,13 @@ def test_gdance_split_preserves_each_actor_and_shares_audio(tmp_path):
         (root / f'{split}_split_sequence_names.txt').write_text('group\n' if split == 'val' else '')
     output = tmp_path / 'single_person'
     assert split_dataset(root, output) == (1, 2)
-    samples = list(load_dataset('gdance').samples(output))
-    assert samples[0].actor != samples[1].actor
-    assert samples[0].audio == samples[1].audio
-    assert {s.sequence for s in samples} == {'group'}
-    assert {s.split for s in samples} == {'val'}
-    for actor, sample in enumerate(samples):
-        with np.load(sample.motion, allow_pickle=False) as saved:
+    sequences = list(discover('gdance', output))
+    assert len(sequences) == 1 and sequences[0].sequence_id == 'group'
+    sequence = sequences[0]
+    assert sequence.split == 'val' and len(sequence.motions) == 2
+    assert sequence.motions[0].actor_id != sequence.motions[1].actor_id
+    assert len(sequence.assets) == 1
+    assert len({link.asset_id for link in sequence.alignments}) == 1
+    for actor, motion in enumerate(sequence.motions):
+        with np.load(motion.path, allow_pickle=False) as saved:
             np.testing.assert_array_equal(saved['smpl_poses'], poses[actor])

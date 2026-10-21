@@ -1,5 +1,5 @@
 """Atomic streaming release writer with shared split shards and bounded buffers."""
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 import json
 import os
@@ -9,8 +9,7 @@ import tempfile
 import numpy as np
 
 from data_pipeline.schema import Inventory
-from data_pipeline.schema.manifest import arrow_schema
-from data_pipeline.schema.records import TABLES
+from data_pipeline.schema.manifest import MetadataWriter
 from data_pipeline.io import resolve_uri
 from data_pipeline.motion.validation import validate_qpos
 
@@ -47,8 +46,7 @@ class ReleaseWriter:
         self.motion_schema = pa.schema([('qpos36', pa.list_(pa.float32(), 36)), ('timestamp_sec', pa.float64())])
         self.quality_schema = pa.schema([('motion_id', pa.string()), ('accepted', pa.bool_()), ('report_json', pa.string())])
         (self.temp / 'meta').mkdir(); (self.temp / 'reports').mkdir(); (self.temp / 'motion').mkdir()
-        self.metadata_writers = {name: pq.ParquetWriter(self.temp / 'meta' / f'{name}.parquet', arrow_schema(cls), compression='zstd') for name,cls in TABLES.items()}
-        self.metadata_buffers = {name: [] for name in TABLES}
+        self.metadata = MetadataWriter(self.temp)
         self.quality_writer = pq.ParquetWriter(self.temp / 'reports/quality-00000.parquet', self.quality_schema, compression='zstd')
         self.qualities = []
         self.writers, self.offsets, self.indices, self.buffers, self.buffered = {}, {}, {}, {}, {}
@@ -60,12 +58,6 @@ class ReleaseWriter:
         if self.buffers.get(split):
             self.writers[split].write_table(pa.concat_tables(self.buffers[split]), row_group_size=16384)
             self.buffers[split] = []; self.buffered[split] = 0
-
-    def _flush_metadata(self, name):
-        import pyarrow as pa
-        if self.metadata_buffers[name]:
-            self.metadata_writers[name].write_table(pa.Table.from_pylist(self.metadata_buffers[name], schema=arrow_schema(TABLES[name])))
-            self.metadata_buffers[name].clear()
 
     def _quality(self, row):
         import pyarrow as pa
@@ -123,14 +115,7 @@ class ReleaseWriter:
             self._quality(dict(motion_id=m.motion_id,accepted=True,report_json=json.dumps(quality,ensure_ascii=False)))
             motions.append(replace(m,storage_uri=relative,row_start=self.offsets[split],quality_ref='reports/quality-00000.parquet'))
             self.offsets[split] += len(qpos); self.count += 1
-        for name in TABLES:
-            for record in (motions if name=='motions' else getattr(inventory,name)):
-                row = asdict(record)
-                if name=='sequences':
-                    row['source_provenance'] = json.dumps(row['source_provenance'],sort_keys=True)
-                self.metadata_buffers[name].append(row)
-                if len(self.metadata_buffers[name])>=2048:
-                    self._flush_metadata(name)
+        self.metadata.add(replace(inventory, motions=motions))
 
     def close(self):
         if self.closed:
@@ -138,8 +123,7 @@ class ReleaseWriter:
         try:
             for split,writer in self.writers.items():
                 self._flush_motion(split); writer.close()
-            for name,writer in self.metadata_writers.items():
-                self._flush_metadata(name); writer.close()
+            self.metadata.close()
             self._quality(None); self.quality_writer.close()
         finally:
             self.closed = True
@@ -156,8 +140,6 @@ class ReleaseWriter:
             self.inventory.write_manifest(self.temp,release=True)
             from .validate import validate_release
             report = validate_release(self.temp,deep_sample=min(32,self.count))
-            report['processing_summary'] = self.inventory.provenance.get('processing_summary', {})
-            report['rejection_reasons'] = self.inventory.provenance.get('rejection_reasons', {})
             (self.temp / 'reports/dataset_summary.json').write_text(json.dumps(report,indent=2))
             if self.output.exists():
                 raise FileExistsError(self.output)

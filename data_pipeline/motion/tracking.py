@@ -1,25 +1,6 @@
-"""Execute a G1 reference at 50 Hz, save video, and produce 30 Hz labels."""
-from pathlib import Path
-import hashlib
-import json
+"""Execute a G1 reference at 50 Hz and return screened 30 Hz label arrays."""
 
 import numpy as np
-
-from data_pipeline.io import read_json, sha256_file, write_json
-
-
-def track(reference, reference_version, execution, quality, tracker_version, output):
-    """Choose a cache directory tied to this reference, controller and screening policy."""
-    identity = dict(reference=reference_version, tracker=tracker_version, execution=execution,
-                    quality=quality, implementation=sha256_file(__file__),
-                    screening=sha256_file(Path(__file__).with_name('quality.py')))
-    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    directory = Path(output) / key
-    directory.mkdir(parents=True, exist_ok=True)
-    result = execute_and_screen(reference, {'execution': execution, 'quality': quality}, directory)
-    write_json(directory / 'fingerprint.json', identity)
-    return {**result, 'path': str((directory / 'paired_motion.npz').resolve()), 'version': tracker_version}
-
 
 from .validation import validate_qpos
 
@@ -34,23 +15,10 @@ def resample_executed(reference, executed, *, control_fps=50., motion_fps=30.):
     return aligned, query > 0
 
 
-def execute_and_screen(reference, config, output):
-    """执行参考轨迹、检查原始控制频率下的质量，再按标签时间重采样。
-
-    输出 paired_motion.npz：qpos_36、公共时间戳、30Hz帧率、执行有效性掩码。
-    输出 quality.json：跌倒/限位检查和执行与参考之间的跟踪误差。
-    """
-    motion_path = output / 'paired_motion.npz'
-    quality_path = output / 'quality.json'
+def track(reference, execution, policy, output, *, diagnostic=False):
+    """只运行计算；output 是外部 Tracker 所需的临时文件桥接目录。"""
+    output.mkdir(parents=True, exist_ok=True)
     rollout = output / 'tracker_rollout.npz'
-    from data_pipeline.video.execution import save_execution_video
-
-    if motion_path.is_file() and quality_path.is_file():
-        quality = read_json(quality_path)
-        if config.get('execution', {}).get('save_video', True):
-            video = save_execution_video(rollout)
-            quality['execution_video'] = str(video.resolve())
-        return quality
 
     import mujoco
     import torch
@@ -68,25 +36,18 @@ def execute_and_screen(reference, config, output):
 
     torch.set_num_threads(4)
 
-    with np.load(reference, allow_pickle=False) as data:
-        ref = data['qpos_36'].copy()
-        source_times = data['source_timestamps'].copy()
-
-    if not rollout.is_file():
-        # 控制器50Hz执行；每次控制包含10个物理子步，这不是最终标签帧率。
-        tracker_config = TrackerRunConfig(
-            reference=reference,
-            holomotion_onnx=config['execution']['onnx'],
-            providers=config['execution'].get('providers', 'CPUExecutionProvider'),
-            target_fps=50.0,
-            control_substeps=10,
-            action_clip=10.0,
-            output=rollout,
-        )
-        run_holomotion_tracker(tracker_config)
-
-    # Save every physical rollout, including those later rejected by screening.
-    if config.get('execution', {}).get('save_video', True):
+    ref = np.asarray(reference, dtype=np.float32)
+    times = np.arange(len(ref), dtype=np.float64) / 30
+    validate_qpos(ref, times)
+    reference_path = output / 'reference.npz'
+    np.savez_compressed(reference_path, qpos_36=ref, source_timestamps=times, fps=np.float32(30))
+    # 控制器50Hz执行；每次控制包含10个物理子步，这不是最终标签帧率。
+    run_holomotion_tracker(TrackerRunConfig(
+        reference=reference_path, holomotion_onnx=execution['onnx'],
+        providers=execution.get('providers', 'CPUExecutionProvider'),
+        target_fps=50., control_substeps=10, action_clip=10., output=rollout))
+    if diagnostic:
+        from .tracking_video import save_execution_video
         save_execution_video(rollout)
 
     with np.load(rollout, allow_pickle=False) as data:
@@ -105,7 +66,6 @@ def execute_and_screen(reference, config, output):
         raise ValueError('Rollout does not match reference/timing; use a new work directory')
 
     kinematics = G1Kinematics()
-    policy = config.get('quality', {})
     # 跌倒的“连续帧数”必须在原控制频率上统计，不能先降到30Hz再数。
     screening = screen_executed_motion(
         executed,
@@ -147,15 +107,6 @@ def execute_and_screen(reference, config, output):
         'rejection_reasons': reasons,
         'screening': screening,
         'tracking': metrics,
-        'execution_video': str((output / 'execution.mp4').resolve()),
         'production_ready': False,
     }
-    np.savez_compressed(
-        output / 'paired_motion.npz',
-        qpos_36=aligned,
-        timestamps=source_times,
-        executed_state_mask=executed_mask,
-        fps=np.float32(30),
-    )
-    write_json(output / 'quality.json', quality)
-    return quality
+    return aligned[executed_mask], quality

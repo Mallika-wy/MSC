@@ -24,16 +24,16 @@ def _init_worker(settings, tracker_version, diagnostic):
     global _worker_context
     encoder = None
     if settings.audio['enabled']:
-        from data_pipeline.audio.cache import AudioCache
+        from data_pipeline.audio.processor import AudioCache
         encoder = AudioCache(settings.audio['model'], chunk_seconds=settings.audio.get('chunk_seconds', 5),
-                             device=settings.audio.get('device', 'cpu'), consolidated=True)
+                             device=settings.audio.get('device', 'cpu'))
     _worker_context = settings, tracker_version, diagnostic, encoder
 
 
 def process_sequence(sequence, settings, tracker_version, diagnostic=False, audio_encoder=None):
-    from data_pipeline.processors.motion import process_motion
-    from data_pipeline.processors.audio import process_audio
-    from data_pipeline.processors.video import process_video
+    from data_pipeline.motion.processor import process_motion
+    from data_pipeline.audio.processor import process_audio
+    from data_pipeline.video.processor import process_video
     motions, assets = [], []
     sequence_record = _record(sequence)
     for source in sequence.motions:
@@ -43,7 +43,7 @@ def process_sequence(sequence, settings, tracker_version, diagnostic=False, audi
             required = settings.release['publish_labels']
             accepted_labels = {a.label_type for a in artifacts if a.quality.get('accepted')}
             accepted = all(label in accepted_labels for label in required)
-            motions.append(dict(source=_record(source), artifacts=[a.record() for a in artifacts],
+            motions.append(dict(source=_record(source), artifacts=[asdict(a) for a in artifacts],
                                 state='accepted' if accepted else 'rejected'))
         except Exception as error:
             motions.append(dict(source=_record(source), artifacts=[], state='error', error=str(error),
@@ -56,7 +56,7 @@ def process_sequence(sequence, settings, tracker_version, diagnostic=False, audi
                          checksum=sha256_file(asset.path))
             if asset.modality == 'audio':
                 artifact = process_audio(asset, audio_encoder, settings.output / 'cache/audio')
-                entry['feature'] = artifact.record()
+                entry['feature'] = asdict(artifact)
                 with wave.open(str(asset.path)) as wav:
                     entry.update(duration_sec=wav.getnframes()/wav.getframerate(), sample_rate_hz=wav.getframerate())
             elif asset.modality == 'video':
@@ -104,8 +104,6 @@ def run(config, *, limit=None, sequence=None, output=None, dry_run=False, diagno
     if settings.asset_manifest is not None:
         from data_pipeline.sources.assets import attach_assets
         sequences = attach_assets(sequences, settings.asset_manifest)
-    if sequence:
-        sequences = (s for s in sequences if s.sequence_id == sequence or any(m.motion_id == sequence for m in s.motions))
     selected = iter(islice(sequences, limit))
     try:
         first = next(selected)

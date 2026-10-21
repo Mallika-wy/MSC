@@ -6,7 +6,7 @@ import numpy as np
 from data_pipeline.schema import (Inventory, SequenceRecord, MotionRecord, AssetRecord,
                                   ModalityLink, TextAnnotation, FeatureRecord)
 from data_pipeline.storage.store import load_arrays, fingerprint
-from .uris import external_uri
+from data_pipeline.io import external_uri
 from .export import ReleaseWriter
 from .features import FeatureShardWriter
 

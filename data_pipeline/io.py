@@ -55,3 +55,14 @@ def resolve_uri(root, uri, external_roots=None):
     if not target.is_relative_to(base):
         raise ValueError(f'URI escapes root: {uri}')
     return target
+
+
+def external_uri(inventory, path):
+    """Register a local parent directory and return its explicit external URI."""
+    path = Path(path).resolve()
+    roots = inventory.external_roots
+    alias = next((key for key, value in roots.items() if value == str(path.parent)), None)
+    if alias is None:
+        alias = f'local_{len(roots)}'
+        roots[alias] = str(path.parent)
+    return f'root://{alias}/{path.name}'

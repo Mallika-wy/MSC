@@ -24,8 +24,12 @@ def song_disjoint(results, config):
             parents[max(a,b)] = min(a,b)
     with tempfile.TemporaryDirectory(prefix='msc-split-') as directory:
         store = Store(Path(directory) / 'results.sqlite')
+        pending = []
         for i,result in enumerate(results):
-            store.record(result['name'],i,result)
+            pending.append((result['name'], i, result))
+            if len(pending) >= 2048:
+                store.record_many(pending)
+                pending.clear()
             if result['state'] not in ('accepted','partial'):
                 continue
             source = result['sequence']
@@ -35,6 +39,7 @@ def song_disjoint(results, config):
                 raise ValueError('song_disjoint requires audio identity')
             for song in songs:
                 union(group,'song:'+song)
+        store.record_many(pending)
         component_songs = {}
         for node in parents:
             if node.startswith('song:'):

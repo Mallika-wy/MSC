@@ -7,14 +7,16 @@
 
 ## 模块与配置
 
-- `sources/<dataset>/` 负责发现、身份、原始时间关系和解码；旧 `sources/audio/` 导入保留兼容。
+- `sources/<dataset>/` 直接返回 SourceSequence，负责发现、身份、原始时间关系和解码。
 - `sources/base.py` 定义 SourceSequence、SourceMotion、SourceAsset、SourceText、SourceAlignment。
-- `processors/` 提供独立的动作、音频和人物视频处理函数；不引入 DAG 或插件框架。
+- `motion/processor.py`、`audio/processor.py`、`video/processor.py` 分别提供独立处理入口。
+- `motion/retarget.py`、`motion/tracking.py` 只负责计算并返回数组；动作缓存统一由 `motion/processor.py` 管理。
+- `motion/tracking_video.py` 负责执行回放；`video/` 负责原始人物视频。
 - `storage/` 保存带指纹的数组 Artifact，以及增量工作记录。
 - `release/builder.py` 统一组装六张表；`release/export.py` 增量写出共享分片并原子发布。
 
 配置采用 `source / motion / audio / video / text / quality / release`。
-已有旧式 YAML 在读取时转换为同一 Settings，禁止混合新旧顶层字段。
+只支持上述配置格式，已移除旧 `dataset/root/retarget/tracker/output` 顶层字段。
 所有配置路径相对于 YAML；只解析启用阶段所需的模型路径，不自动下载任何数据或模型。
 
 ```yaml
@@ -101,7 +103,8 @@ manifest 用 `feature_storage`、`package_mode`、`features_bundled` 标记特�
 
 缓存采用 SQLite 事务完成标记、内容校验和和固定数量的文件锁，进程退出后锁自动释放。
 不同资产共享内容和处理配置时复用同一记录；换 MERT 不影响动作缓存，改 Tracker 不重算 GMR。
-正常运行不会留下逐动作 NPZ、JSON 或视频。重型运动学组件使用临时工作目录，结束后清理。
+正常运行不会留下逐动作 NPZ、JSON 或视频。GMR 和参考质检直接传递数组；只有外部 Tracker 的文件接口
+需要临时输入/rollout，结束后清理。启用诊断时才保留原始 rollout、报告和回放。
 显式启用的人物视频裁剪按唯一视频/人物/配置保存媒体和空间时间映射；这类媒体缓存仍按视频保存，
 不会因为同一视频关联多个动作而复制。
 

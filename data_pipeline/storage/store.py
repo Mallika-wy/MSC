@@ -67,11 +67,6 @@ class Store:
                        (key, json.dumps(metadata, allow_nan=False), payload, hashlib.sha256(payload).hexdigest()))
         return dict(store=str(self.path), key=key)
 
-    def record(self, name, ordinal, result):
-        with self.connect() as db:
-            db.execute('INSERT OR REPLACE INTO results VALUES (?,?,?)',
-                       (name, ordinal, json.dumps(result, allow_nan=False)))
-
     def record_many(self, rows):
         if rows:
             with self.connect() as db:

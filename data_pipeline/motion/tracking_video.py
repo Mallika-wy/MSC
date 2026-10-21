@@ -1,4 +1,4 @@
-"""Render the saved physical tracker rollout for human review."""
+"""Render physical tracker states for diagnostics, without advancing simulation."""
 from pathlib import Path
 
 import numpy as np

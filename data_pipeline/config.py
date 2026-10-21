@@ -1,4 +1,4 @@
-"""Normalize legacy and dataset-centric YAML; resolve only enabled dependencies."""
+"""Read dataset-centric YAML; resolve only enabled dependencies."""
 from dataclasses import dataclass, field
 from pathlib import Path
 import yaml
@@ -26,18 +26,17 @@ class Settings:
         values = yaml.safe_load(config.read_text())
         def path(value):
             return str((config.parent / Path(value).expanduser()).resolve())
-        modern = 'source' in values
-        if modern and any(key in values for key in ('dataset', 'root', 'retarget', 'tracker')):
-            raise ValueError('Do not mix legacy and source/motion configuration')
-        source = values['source'] if modern else values
+        if 'source' not in values or any(key in values for key in ('dataset', 'root', 'retarget', 'tracker', 'output')):
+            raise ValueError('Use source/motion/release configuration; legacy top-level fields are unsupported')
+        source = values['source']
         dataset = source['dataset']
         if dataset not in DATASETS:
             raise ValueError(f'Unsupported dataset: {dataset}')
         motion = values.get('motion', {})
         if motion.get('target_fps', 30) != 30 or motion.get('representation', 'g1_qpos36') != 'g1_qpos36':
             raise ValueError('MSC release requires g1_qpos36 at 30 FPS')
-        retarget = dict(motion.get('retarget', {}) if modern else values.get('retarget', {}))
-        tracker = dict(motion.get('tracking', {}) if modern else values.get('tracker', {}))
+        retarget = dict(motion.get('retarget', {}))
+        tracker = dict(motion.get('tracking', {}))
         retarget.setdefault('enabled', 'auto')
         tracker.setdefault('enabled', dataset != 'omg')
         audio = dict(values.get('audio', {}))
@@ -63,10 +62,9 @@ class Settings:
         release.setdefault('max_shard_frames', 1_000_000)
         release.setdefault('alignment_policy', 'allow_estimated')
         release.setdefault('split_policy', 'preserve')
-        default = 'tracker_executed' if tracker['enabled'] else ('source_g1' if dataset == 'omg' else 'retarget_reference')
-        release.setdefault('train_default', default)
-        release.setdefault('publish_labels', ['source_g1'] if dataset == 'omg' and not tracker['enabled'] else
-                           (['source_g1' if dataset == 'omg' else 'retarget_reference', 'tracker_executed'] if tracker['enabled'] else ['retarget_reference']))
+        parent = 'source_g1' if dataset == 'omg' else 'retarget_reference'
+        release.setdefault('train_default', 'tracker_executed' if tracker['enabled'] else parent)
+        release.setdefault('publish_labels', [parent, 'tracker_executed'] if tracker['enabled'] else [parent])
         labels = release['publish_labels']
         if not isinstance(labels, list) or not labels or len(labels) != len(set(labels)) or not set(labels) <= {'source_g1','retarget_reference','tracker_executed'}:
             raise ValueError('publish_labels must be unique supported labels')
@@ -76,14 +74,13 @@ class Settings:
             raise ValueError('train_default must be a published label')
         if 'tracker_executed' in release['publish_labels'] and not tracker['enabled']:
             raise ValueError('Executed labels require tracking')
-        parent = 'source_g1' if dataset == 'omg' else 'retarget_reference'
         if 'tracker_executed' in release['publish_labels'] and parent not in release['publish_labels']:
             raise ValueError('Executed labels require their published parent')
         if release['alignment_policy'] not in ('allow_estimated', 'verified_only'):
             raise ValueError('Invalid alignment_policy')
         if release['split_policy'] not in ('preserve', 'song_disjoint'):
             raise ValueError('Invalid split_policy')
-        destination = Path(output).resolve() if output else Path(path(release.get('output', values.get('output', 'processed'))))
+        destination = Path(output).resolve() if output else Path(path(release.get('output', 'processed')))
         root = Path(path(source['root']))
         if destination == root or destination.is_relative_to(root) or root.is_relative_to(destination):
             raise ValueError('Output must be outside the source dataset')

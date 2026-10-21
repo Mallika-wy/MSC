@@ -17,6 +17,44 @@ def arrow_schema(record_type):
                       for f in fields(record_type)])
 
 
+class MetadataWriter:
+    """Write the six metadata tables with one shared, bounded serialization path."""
+    def __init__(self, root):
+        import pyarrow.parquet as pq
+        folder = Path(root) / 'meta'
+        folder.mkdir(parents=True, exist_ok=True)
+        self.writers = {name: pq.ParquetWriter(folder / f'{name}.parquet', arrow_schema(cls), compression='zstd')
+                        for name, cls in TABLES.items()}
+        self.buffers = {name: [] for name in TABLES}
+        self.closed = False
+
+    def add(self, inventory):
+        for name in TABLES:
+            for record in getattr(inventory, name):
+                row = asdict(record)
+                if name == 'sequences':
+                    row['source_provenance'] = json.dumps(row['source_provenance'], sort_keys=True)
+                self.buffers[name].append(row)
+                if len(self.buffers[name]) >= 2048:
+                    self.flush(name)
+
+    def flush(self, name):
+        import pyarrow as pa
+        if self.buffers[name]:
+            self.writers[name].write_table(pa.Table.from_pylist(self.buffers[name], schema=arrow_schema(TABLES[name])))
+            self.buffers[name].clear()
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                for name in TABLES:
+                    self.flush(name)
+            finally:
+                for writer in self.writers.values():
+                    writer.close()
+
+
 @dataclass
 class Inventory:
     sequences: list = field(default_factory=list)
@@ -33,20 +71,16 @@ class Inventory:
         return validate_inventory(self, root, release=release, check_files=check_files)
 
     def write(self, root, *, release=False):
-        import pyarrow as pa
-        import pyarrow.parquet as pq
         root = Path(root)
         self.validate(root, release=release)
         root.mkdir(parents=True, exist_ok=True)
         if (root / 'dataset.json').exists():
             raise FileExistsError(root / 'dataset.json')
-        (root / 'meta').mkdir(exist_ok=True)
-        for name, cls in TABLES.items():
-            rows = [asdict(r) for r in getattr(self, name)]
-            if name == 'sequences':
-                for r in rows:
-                    r['source_provenance'] = json.dumps(r['source_provenance'], sort_keys=True)
-            pq.write_table(pa.Table.from_pylist(rows, schema=arrow_schema(cls)), root / 'meta' / f'{name}.parquet', compression='zstd')
+        writer = MetadataWriter(root)
+        try:
+            writer.add(self)
+        finally:
+            writer.close()
         self.write_manifest(root, release=release)
         return root
 

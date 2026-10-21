@@ -48,8 +48,8 @@ def test_poststep_timestamps_require_initial_state_and_slerp_handles_sign():
         resample_motion_at_times(q, [0, 0, .04], [0])
 
 
-from data_pipeline.motion.tracking import validate_qpos, execute_and_screen
-from data_pipeline.io import write_json
+from data_pipeline.motion.validation import validate_qpos
+from data_pipeline.motion.tracking import track
 from data_pipeline.video.media import nearest_frames
 
 
@@ -66,17 +66,33 @@ def test_invalid_motion_quaternion():
         validate_qpos(np.zeros((2, 36)), np.array([0, 1/30]))
 
 
-def test_execution_cache_preserves_quality_and_creates_video(tmp_path, monkeypatch):
-    from data_pipeline.video import execution as execution_video
-    calls = []
-    monkeypatch.setattr(execution_video, 'save_execution_video',
-                        lambda rollout: calls.append(rollout) or tmp_path / 'execution.mp4')
-    (tmp_path / 'paired_motion.npz').touch()
-    path = tmp_path / 'quality.json'
-    quality = {'accepted': False, 'rejection_reasons': ['persistent_fall']}
-    write_json(path, quality)
-    before = path.read_bytes()
-    result = execute_and_screen(None, {}, tmp_path)
-    assert result == {**quality, 'execution_video': str(tmp_path / 'execution.mp4')}
-    assert calls == [tmp_path / 'tracker_rollout.npz']
-    assert path.read_bytes() == before
+@pytest.mark.parametrize('diagnostic', [False, True])
+def test_tracking_returns_trimmed_arrays_and_only_renders_diagnostics(tmp_path, monkeypatch, diagnostic):
+    import sys
+    from types import ModuleType, SimpleNamespace
+    from data_pipeline.motion import tracking_video
+    reference = states(31).astype(np.float32)
+    sampled = states(50).astype(np.float32)
+    xml = tmp_path / 'robot.xml'
+    xml.write_text('<mujoco><option timestep="0.002"/><worldbody><body><freejoint/>'
+                   '<geom type="sphere" size=".1" mass="1"/></body></worldbody></mujoco>')
+    runs, videos = [], []
+    def execute(config):
+        runs.append(config)
+        np.savez(config.output, executed_qpos_36=sampled, reference_qpos_36=sampled,
+                 fps=50., robot_xml=str(xml))
+    for name in ('omg', 'omg.tracking', 'omg.tracking.holomotion'):
+        module = ModuleType(name); module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(sys.modules, 'omg.tracking.holomotion.reference',
+                        SimpleNamespace(resample_qpos=lambda *args: sampled))
+    monkeypatch.setitem(sys.modules, 'omg.tracking.holomotion.runner',
+                        SimpleNamespace(TrackerRunConfig=SimpleNamespace, run_holomotion_tracker=execute))
+    monkeypatch.setattr(tracking_video, 'save_execution_video', lambda path: videos.append(path))
+    labels, quality = track(reference, {'onnx':'mock'}, {'strict_joint_limits':False},
+                            tmp_path / 'work', diagnostic=diagnostic)
+    assert len(runs) == 1 and len(videos) == int(diagnostic)
+    np.testing.assert_allclose(labels, reference[1:])
+    assert quality['accepted'] and quality['tracking']['joint_rmse_rad'] == pytest.approx(0.)
+    assert not (tmp_path / 'work/paired_motion.npz').exists()
+    assert not (tmp_path / 'work/quality.json').exists()

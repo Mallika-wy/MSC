@@ -25,7 +25,7 @@ def _metadata(root_string):
     return info, provenance
 
 
-def discover(root, *, text=True, sequence=None):
+def discover(root, *, audio=False, text=True, video=False, sequence=None):
     import pyarrow.parquet as pq
     root = Path(root).resolve()
     info, provenance = _metadata(str(root))

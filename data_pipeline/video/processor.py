@@ -12,6 +12,22 @@ from data_pipeline.video.geometry import crop_affines, interpolate_boxes, plan_c
 from data_pipeline.video.media import render, verify_encoded
 from data_pipeline.io import read_json, write_json
 from data_pipeline.video.media import PTS_TOLERANCE_S, nearest_frames, probe_video
+from data_pipeline.video.config import PersonVideoConfig
+from data_pipeline.storage.store import fingerprint, digest
+
+
+def process_video(source, output, config):
+    settings = {k: v for k, v in config.items() if k != 'enabled'}
+    if source.metadata.get('track_id') is not None:
+        settings['track_id'] = int(source.metadata['track_id'])
+    key = fingerprint({'source': digest(source.path), 'settings': settings,
+                       'weights': digest(settings['weights']),
+                       'implementation': {p.name: digest(p) for p in Path(__file__).parent.glob('*.py')}})
+    result = preprocess_person_video(source.path, Path(output) / key, PersonVideoConfig(**settings))
+    with np.load(result['metadata'], allow_pickle=False) as data:
+        result['source_time_origin_sec'] = float(data['source_requested_pts'][0])
+        result['track_id'] = int(data['track_id'])
+    return result
 
 
 def select_track(records, times, track_id, max_gap_s):

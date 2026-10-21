@@ -20,7 +20,7 @@ def make_wav(path):
         stream.writeframes(b'\0' * 48000)
 
 
-def legacy_config(tmp_path, names=('accepted', 'rejected', 'broken')):
+def make_config(tmp_path, names=('accepted', 'rejected', 'broken')):
     raw = tmp_path / 'raw'
     (raw / 'motions').mkdir(parents=True)
     for name in names:
@@ -28,8 +28,9 @@ def legacy_config(tmp_path, names=('accepted', 'rejected', 'broken')):
         make_wav(raw / 'wavs' / f'{name}.wav')
     (tmp_path / 'tracker.onnx').write_bytes(b'synthetic-controller')
     config = tmp_path / 'config.yaml'
-    config.write_text(yaml.safe_dump(dict(dataset='aistpp', root='raw', output='processed',
-        retarget=dict(gmr_root='gmr', smpl_model='smpl.pkl'), tracker=dict(onnx='tracker.onnx'),
+    config.write_text(yaml.safe_dump(dict(source=dict(dataset='aistpp', root='raw'),
+        motion=dict(retarget=dict(gmr_root='gmr', smpl_model='smpl.pkl'), tracking=dict(onnx='tracker.onnx')),
+        release=dict(output='processed'),
         audio=dict(model='mert'))))
     return config
 
@@ -37,19 +38,16 @@ def legacy_config(tmp_path, names=('accepted', 'rejected', 'broken')):
 @pytest.mark.parametrize('diagnostic', [False, True])
 def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_path, monkeypatch, diagnostic):
     from data_pipeline.motion import retarget, tracking, arm_twist
-    from data_pipeline.audio import cache
-    from data_pipeline.processors import motion
-    config = legacy_config(tmp_path)
+    from data_pipeline.audio import processor as cache
+    from data_pipeline.motion import processor as motion
+    config = make_config(tmp_path)
     qpos = np.zeros((6, 36), dtype=np.float32)
     qpos[:, 0] = np.arange(6) / 30
     qpos[:, 2:4] = [.8, 1.]
-    def solve(sample, dataset, settings, output):
-        if sample.name == 'broken':
+    def solve(source, dataset, settings):
+        if source.motion_id == 'broken':
             raise ValueError('broken source')
-        output.mkdir(parents=True, exist_ok=True)
-        reference = output / 'motion.npz'
-        np.savez(reference, qpos_36=qpos, source_timestamps=np.arange(6)/30)
-        return reference, 'synthetic-gmr', {}
+        return qpos.copy(), {}
     # Source identity is explicit, not inferred from temporary output names.
     original_process = motion.process_motion
     current = []
@@ -59,12 +57,9 @@ def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_
     def screen(reference, policy):
         return {'accepted': current[0] != 'rejected', 'rejection_reasons': []}
     calls = []
-    def execute(reference, version, execution, quality, controller, output):
+    def execute(reference, execution, quality, output, *, diagnostic=False):
         calls.append(reference)
-        output.mkdir(parents=True)
-        paired = output / 'paired_motion.npz'
-        np.savez(paired, qpos_36=qpos, executed_state_mask=np.arange(6)>0)
-        return dict(accepted=True, path=str(paired), version=controller)
+        return qpos[1:].copy(), dict(accepted=True)
     class Encoder:
         def __init__(self, *args, **kwargs): pass
         def extract(self, wav, output):
@@ -102,7 +97,7 @@ def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_
 
 
 def test_dry_run_lists_real_pairs_without_creating_output(tmp_path):
-    config = legacy_config(tmp_path, ['one'])
+    config = make_config(tmp_path, ['one'])
     assert run(config, dry_run=True)['count'] == 1
     assert not (tmp_path / 'processed').exists()
     with pytest.raises(ValueError, match='No matching'):
@@ -124,7 +119,7 @@ def _parallel_fake_init(*args):
 
 def test_spawn_workers_keep_errors_and_stable_publication_order(tmp_path, monkeypatch):
     from data_pipeline import pipeline
-    config = legacy_config(tmp_path)
+    config = make_config(tmp_path)
     monkeypatch.setattr(pipeline, '_init_worker', _parallel_fake_init)
     published = []
     def publish(work, output, config):

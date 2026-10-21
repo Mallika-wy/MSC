@@ -1,5 +1,5 @@
 """Small typed processor outputs, serialized in the work ledger."""
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -12,15 +12,9 @@ class MotionArtifact:
     time_origin_sec: float = 0.
     parent_label: str | None = None
 
-    def record(self):
-        return asdict(self)
-
 
 @dataclass
 class FeatureArtifact:
     asset_id: str
     arrays: dict
     metadata: dict = field(default_factory=dict)
-
-    def record(self):
-        return asdict(self)
