@@ -31,3 +31,19 @@ is retained in `licenses/Psi0-Apache-2.0.txt` (Copyright 2026 PSI-lab, USC).
 
 Pretrained T5 weights and official OMG datasets are external user-supplied assets,
 not redistributed in this package.
+
+The offline motion pipeline vendors GMR source and Unitree G1 assets in
+`third_party/gmr` at revision `bb1bbe40774794fceb2a7c579a3464a28e68c844`
+(MIT; see `third_party/gmr/LICENSE`). SONIC deployment constants, observation
+reference code, MuJoCo configuration, and G1 simulator assets are in
+`third_party/sonic` at revision `45c03facbf848e0c743091b7d9c17952096ff908`
+(see its `LICENSE` and `legal/` notices). SONIC model weights and the NVIDIA Open
+Model License are kept locally in ignored `model/sonic/`; the weights are not
+distributed by this repository. The G1 meshes needed by SONIC's scene were
+copied from the vendored GMR G1 assets because the upstream repository stores
+them via Git LFS. The offline Python runner uses the official model and ports
+only its G1 observation, motor mapping, and control loop; it does not require
+the upstream ROS/DDS/TensorRT deployment stack.
+
+The vendored GMR IK calls pass `damping`, `safety_break`, and `limits` explicitly
+for compatibility with the installed Mink API, reusing the existing joint limits.
