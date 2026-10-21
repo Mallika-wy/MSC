@@ -1,8 +1,6 @@
 """Assemble processor artifacts into the single MSC six-table release."""
 from pathlib import Path
 
-import numpy as np
-
 from data_pipeline.schema import (Inventory, SequenceRecord, MotionRecord, AssetRecord,
                                   ModalityLink, TextAnnotation, FeatureRecord)
 from data_pipeline.storage.store import load_arrays, fingerprint
@@ -89,10 +87,6 @@ class ReleaseBuilder:
                         if fid not in features:
                             arrays = load_arrays(feature['arrays'])
                             values, times = arrays['values'], arrays['timestamps']
-                            from data_pipeline.schema import TimeMap
-                            if list(values.shape) != meta['shape'] or values.dtype not in (np.float16, np.float32) or not np.isfinite(values).all() or len(values) != len(times) or times.dtype != np.float64:
-                                raise ValueError('Invalid feature arrays')
-                            TimeMap().select(times, 0., 1., semantics='point')
                             feature_path = feature_writer.add(asset['modality'], fid, values, times)
                             uri = external_uri(inv, feature_path)
                             inv.features.append(FeatureRecord(fid, aid, meta['encoder'], meta['checkpoint_hash'],

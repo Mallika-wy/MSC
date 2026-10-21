@@ -1,5 +1,6 @@
 """Shared SMPL-X forward kinematics; dataset decoding lives in sources/."""
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -17,34 +18,42 @@ class HumanMotion:
     provenance: dict = field(default_factory=dict)
 
 
-def human_motion(pose, trans, betas, left, right, settings):
-    """Convert local 30 Hz axis angles to Z-up world joints for GMR."""
+@lru_cache(maxsize=2)
+def _body_model(path):
     import smplx
     import torch
+    model = smplx.SMPLX(model_path=path, gender='neutral', use_pca=False, flat_hand_mean=True).eval()
+    with torch.no_grad():
+        vertices = model(return_verts=True).vertices
+        height = float(vertices[0, :, 1].max() - vertices[0, :, 1].min())
+    return model, height
+
+
+def human_motion(pose, trans, betas, left, right, settings):
+    """Evaluate the 55-joint skeleton without per-frame mesh skinning."""
+    import torch
     from smplx.joint_names import JOINT_NAMES
+    from smplx.lbs import blend_shapes, vertices2joints, batch_rodrigues, batch_rigid_transform
 
     if (len(pose) < 2 or trans.shape != (len(pose), 3)
             or not all(np.isfinite(value).all() for value in (pose, trans, betas, left, right))):
         raise ValueError('Invalid source motion')
-    model = smplx.SMPLX(model_path=str(settings['smpl_model']), gender='neutral',
-                        use_pca=False, flat_hand_mean=True)
+    model, height = _body_model(str(settings['smpl_model']))
     betas = np.pad(betas, (0, max(0, model.num_betas - len(betas))))[:model.num_betas]
     positions, rotations = [], []
     with torch.no_grad():
-        neutral = model(return_verts=True)
-        height = float(neutral.vertices[0, :, 1].max() - neutral.vertices[0, :, 1].min())
+        shaped = model.v_template + blend_shapes(torch.as_tensor(betas).float()[None], model.shapedirs)
+        joints = vertices2joints(model.J_regressor, shaped)
         for start in range(0, len(pose), 64):
             sl = slice(start, start + 64)
-            zeros = torch.zeros((len(pose[sl]), 3), dtype=torch.float32)
-            result = model(betas=torch.from_numpy(betas).float().reshape(1, -1),
-                global_orient=torch.from_numpy(pose[sl, 0]).float(),
-                body_pose=torch.from_numpy(pose[sl, 1:22].reshape(-1, 63)).float(),
-                left_hand_pose=torch.from_numpy(left[sl]).float(),
-                right_hand_pose=torch.from_numpy(right[sl]).float(),
-                jaw_pose=zeros, leye_pose=zeros, reye_pose=zeros,
-                transl=torch.from_numpy(trans[sl]).float(), return_full_pose=True)
-            positions.append(result.joints[:, :55].numpy())
-            rotations.append(result.full_pose.numpy().reshape(-1, 55, 3))
+            count = len(pose[sl])
+            full_pose = torch.cat((torch.from_numpy(pose[sl, :22].reshape(count, 66)).float(),
+                                   torch.zeros((count, 9), dtype=torch.float32), torch.from_numpy(left[sl]).float(),
+                                   torch.from_numpy(right[sl]).float()), dim=1) + model.pose_mean
+            matrices = batch_rodrigues(full_pose.reshape(-1, 3)).reshape(count, 55, 3, 3)
+            posed_joints, _ = batch_rigid_transform(matrices, joints.expand(count, -1, -1), model.parents)
+            positions.append((posed_joints + torch.from_numpy(trans[sl]).float()[:, None]).numpy())
+            rotations.append(full_pose.numpy().reshape(-1, 55, 3))
     positions = np.concatenate(positions)
     local = Rotation.from_rotvec(np.concatenate(rotations).reshape(-1, 3)).as_matrix().reshape(-1, 55, 3, 3)
     parents = model.parents.numpy()

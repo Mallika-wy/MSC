@@ -1,18 +1,21 @@
 # Paths are relative to this YAML. No models are downloaded.
 source:
   dataset: finedance
-  root: ../../data/raw_audio/FineDance
+  root: ../../../data/FineDance
 motion:
   target_fps: 30
   representation: g1_qpos36
   retarget:
     enabled: auto
-    gmr_root: ../../../GMR
+    gmr_root: ../../third_party/gmr
     smpl_model: ../../model/smplx/SMPLX_NEUTRAL.npz
     gender: neutral
   tracking:
     enabled: true
-    onnx: ../../model/holomotion/model.onnx
+    sonic_root: ../../third_party/sonic
+    encoder: ../../model/sonic/model_encoder.onnx
+    decoder: ../../model/sonic/model_decoder.onnx
+    observation_config: ../../model/sonic/observation_config.yaml
     providers: CPUExecutionProvider
 audio:
   enabled: true

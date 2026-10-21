@@ -307,7 +307,7 @@ MSC/
 - 不使用 Qwen2.5-Omni、Qwen3-VL 或任何大语言模型作为统一 Backbone
 - 不实现 Video Encoder
 - 不实现 Ψ₀ 原有的机械臂任务和 70D Action Format
-- 不实现机器人部署、ROS、ZMQ、SONIC、HoloMotion
+- 不实现机器人部署、ROS、ZMQ；数据预处理的离线执行使用 SONIC
 - 不实现 Streaming Runner、RTC、异步重规划或 Execution Feedback
 - 不训练新的低层 Tracking Policy
 - 不自动下载大型预训练权重或数据集

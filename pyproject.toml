@@ -12,12 +12,13 @@ dependencies = ["torch>=2.3", "numpy>=1.24", "PyYAML>=6"]
 [project.optional-dependencies]
 text = ["transformers>=4.40,<5", "sentencepiece>=0.2", "safetensors"]
 data = ["datasets>=2.19", "pyarrow>=14"]
-pipeline = ["pyarrow>=14", "scipy>=1.10", "transformers>=4.40,<5", "onnxruntime>=1.18", "smplx>=0.1.28"]
+pipeline = ["pyarrow>=15", "scipy>=1.10", "transformers>=4.40,<5", "onnxruntime>=1.18", "mujoco>=3.3,<4", "smplx>=0.1.28", "mink>=1.0", "qpsolvers>=4", "daqp>=0.8", "rich>=13", "natsort>=8", "opencv-python>=4"]
 test = ["pytest>=8"]
 
 [project.scripts]
 msc-train = "msc.train:main"
 msc-sample = "msc.sample:main"
+msc-execute = "msc.execute:main"
 msc-evaluate = "msc.evaluate:main"
 msc-cache-text = "msc.cache_text:main"
 msc-data = "data_pipeline.cli:main"

@@ -9,7 +9,7 @@ from data_pipeline.video.media import encoder, verify_encoded
 def save_execution_video(rollout: Path) -> Path:
     """Replay post-control states at native FPS; never advance the simulator."""
     import mujoco
-    from omg.tracking.holomotion.runtime import build_g1_state_handles, set_g1_qpos
+    from .sonic import state_handles, set_qpos
 
     rollout = Path(rollout)
     video = rollout.parent / 'execution.mp4'
@@ -27,7 +27,7 @@ def save_execution_video(rollout: Path) -> Path:
     model.vis.global_.offwidth = model.vis.global_.offheight = 512
     model.vis.quality.offsamples = 0
     state = mujoco.MjData(model)
-    handles = build_g1_state_handles(model)
+    handles = state_handles(model)
     camera = mujoco.MjvCamera()
     mujoco.mjv_defaultFreeCamera(model, camera)
     camera.azimuth, camera.elevation, camera.distance = 135., -20., 2.8
@@ -38,7 +38,7 @@ def save_execution_video(rollout: Path) -> Path:
     try:
         with encoder(temporary, 512, 512, fps) as stream:
             for frame in qpos:
-                set_g1_qpos(model, state, handles, frame)
+                set_qpos(model, state, frame, handles)
                 mujoco.mj_forward(model, state)
                 camera.lookat[:] = [frame[0], frame[1], .65]
                 renderer.update_scene(state, camera=camera)

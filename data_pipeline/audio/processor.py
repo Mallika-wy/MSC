@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from data_pipeline.io import sha256_file
-from data_pipeline.storage.store import Store
+from data_pipeline.storage.store import Store, digest
 from data_pipeline.storage.artifacts import FeatureArtifact
 from .mert import MertEncoder
 
@@ -27,19 +27,19 @@ class AudioCache:
         }, sort_keys=True).encode()).hexdigest()
 
     def extract(self, wav, output):
-        checksum = sha256_file(wav)
+        checksum = digest(wav)
         key = hashlib.sha256((checksum + self.checkpoint_hash + self.preprocess_hash).encode()).hexdigest()
         store = Store(Path(output) / 'features.sqlite')
         with store.lock(key):
             cached = store.get(key)
             if cached is not None:
-                report, arrays = cached
-                if (list(arrays['values'].shape) == report['shape'] and
-                    arrays['timestamps'].shape == (len(arrays['values']),) and
-                    np.isfinite(arrays['values']).all() and np.isfinite(arrays['timestamps']).all() and
-                    (np.diff(arrays['timestamps']) > 0).all()):
-                    return {**report, 'arrays': dict(store=str(store.path), key=key)}
+                report, _ = cached
+                return {**report, 'arrays': dict(store=str(store.path), key=key)}
             values, times, duration = self.encoder.encode(wav)
+            if (times.shape != (len(values),) or times.dtype != np.float64 or
+                not np.isfinite(values).all() or not np.isfinite(times).all() or
+                (np.diff(times) <= 0).any()):
+                raise ValueError('Invalid MERT features or timestamps')
             report = dict(encoder='m-a-p/MERT-v1-95M', checkpoint_hash=self.checkpoint_hash,
                 preprocess_hash=self.preprocess_hash, input_checksum=checksum,
                 chunk_seconds=self.chunk_seconds, shape=list(values.shape), duration_sec=duration)

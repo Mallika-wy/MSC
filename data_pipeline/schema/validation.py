@@ -23,10 +23,6 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
         for r in records:
             if not isinstance(r, cls):
                 raise ValueError(f'{name}: expected {cls.__name__}')
-            identity = getattr(r, key)
-            if not isinstance(identity, str) or not identity.strip() or identity in ids[name]:
-                raise ValueError(f'Duplicate or empty {key}: {identity}')
-            ids[name][identity] = r
             for f in record_fields:
                 value = getattr(r, f.name)
                 hint = hints[f.name]
@@ -46,6 +42,10 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
                     raise ValueError(f'Invalid type/value for {name}.{f.name}: {value!r}')
                 if isinstance(value, str) and not value.strip():
                     raise ValueError(f'Empty {name}.{f.name}')
+            identity = getattr(r, key)
+            if identity in ids[name]:
+                raise ValueError(f'Duplicate {key}: {identity}')
+            ids[name][identity] = r
             if name == 'features' and any(type(n) is not int for n in r.shape):
                 raise ValueError('Feature shape must contain integers')
     def require(table, key):
@@ -62,8 +62,8 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
         checked_uris.add(value)
     sources = {}
     for s in inventory.sequences:
-        if not all((s.source_dataset, s.source_sequence_id, s.split_group_id, s.source_provenance)):
-            raise ValueError('Sequence identity/provenance required')
+        if not s.source_provenance:
+            raise ValueError('Sequence provenance required')
         if s.split not in ('train', 'val', 'test', 'unassigned') or (release and s.split == 'unassigned'):
             raise ValueError('Invalid/unassigned split')
         source_key = (s.source_dataset, s.source_sequence_id)
@@ -81,8 +81,6 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
             raise ValueError('Invalid motion contract')
         if m.label_type not in ('source_g1', 'retarget_reference', 'tracker_executed'):
             raise ValueError('Invalid label_type')
-        if not all((m.actor_id, m.group_id, m.retarget_version, m.tracker_version, m.quality_ref)):
-            raise ValueError('Motion identity and processing provenance required')
         if m.label_type == 'retarget_reference' and m.retarget_version == 'not_applicable':
             raise ValueError('Retarget reference requires retarget version')
         if m.label_type == 'tracker_executed' and (not m.parent_motion_id or m.tracker_version == 'not_applicable'):
@@ -94,12 +92,11 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
             raise ValueError('Invalid asset')
         if not re.fullmatch(r'[0-9a-f]{64}', a.checksum):
             raise ValueError('Asset checksum must be SHA256 hex')
-        if not all((a.source_asset_id, a.checksum, a.license_ref)):
-            raise ValueError('Asset identity/checksum/license required')
         for value in (a.duration_sec, a.sample_rate_hz, a.frame_rate):
             if value is not None and value <= 0:
                 raise ValueError('Asset rates/duration must be positive')
-        uri(a.uri)
+        if a.uri is not None:
+            uri(a.uri)
     asset_splits = {}
     for link in inventory.links:
         m = require('motions', link.motion_id)
@@ -124,8 +121,8 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
                     raise ValueError('Shared asset split leakage')
     for a in inventory.annotations:
         s = require('sequences', a.sequence_id)
-        if not a.text.strip() or not a.language or not a.source or not 0 <= a.confidence <= 1:
-            raise ValueError('Invalid text annotation')
+        if not 0 <= a.confidence <= 1:
+            raise ValueError('Invalid text confidence')
         if not 0 <= a.start_sec < a.end_sec:
             raise ValueError('Invalid annotation interval')
         if a.motion_id:
@@ -134,8 +131,6 @@ def validate_inventory(inventory, root='.', *, release=False, check_files=False)
                 raise ValueError('Annotation motion/coverage mismatch')
     for f in inventory.features:
         a = require('assets', f.asset_id)
-        if not all((f.encoder_name, f.encoder_checkpoint_hash, f.preprocess_hash, f.extraction_version, f.aggregation_method)):
-            raise ValueError('Feature fingerprint required')
         if f.input_asset_checksum != a.checksum or f.token_time_semantics not in ('point', 'interval'):
             raise ValueError('Feature identity/time semantics mismatch')
         if len(f.shape) < 2 or any(n <= 0 for n in f.shape) or f.dtype not in ('float16', 'float32', 'bfloat16'):

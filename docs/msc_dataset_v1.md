@@ -22,19 +22,24 @@
 ```yaml
 source:
   dataset: omg
-  root: ../../../OMG/data/OMG-Data
+  root: ../../../data/OMG-Data
 motion:
   target_fps: 30
   representation: g1_qpos36
   retarget: {enabled: auto}
-  tracking: {enabled: false}
+  tracking:
+    enabled: true
+    sonic_root: ../../third_party/sonic
+    encoder: ../../model/sonic/model_encoder.onnx
+    decoder: ../../model/sonic/model_decoder.onnx
+    observation_config: ../../model/sonic/observation_config.yaml
 audio: {enabled: false}
 video: {enabled: false}
 text: {enabled: true}
 release:
   output: ../../data/processed/omg-text
-  publish_labels: [source_g1]
-  train_default: source_g1
+  publish_labels: [source_g1, tracker_executed]
+  train_default: tracker_executed
   max_shard_frames: 1000000
   split_policy: preserve
   alignment_policy: allow_estimated
@@ -43,9 +48,8 @@ release:
 OMG 读取当前 `meta/info.json`、episode 元数据和 `observation.state[36]`，不使用下一帧参考 `action`。
 保留原始 episode 编号、上游来源、split 和清洗报告校验和；不要求未经修改的官方 manifest 哈希。
 读取会校验 episode 身份、全局索引、局部帧号、30 FPS 时间戳和 qpos 数值。
-原生 G1 默认跳过 GMR 和 Tracker，不重复执行已经完成的历史质量删除。
-这条路径的 Artifact 直接引用源分片行范围和内容校验和，不重复缓存动作数组；重新发布时验证源文件未改变。
-人体动作默认使用现有 GMR 和参考质检；Tracker 可选。FineDance/GDance 的 SMPL-X 近似不变。
+OMG 原生 G1 跳过 GMR，但按上述配置交给 SONIC 重执行；原始 `source_g1` 仍是执行动作的父记录。
+不启用 tracking 时，原始动作可直接引用源分片行范围和内容校验和。人体动作保留 GMR 和参考质检；FineDance/GDance 的 SMPL-X 近似不变。
 
 `publish_labels` 与 `train_default` 分离；发布 tracker_executed 必须同时发布其参考父动作。
 执行标签去掉初始化帧，从源时间 `1/30` 秒开始；资产映射和文本区间同时修正。
@@ -97,14 +101,17 @@ QC 每行包含 `motion_id / accepted / report_json`。`quality_ref` 引用共�
 
 特征每行包含 `feature_id / shape / dtype / values / timestamps / timestamp_shape`，
 按 feature_id 读取，`feature_uri` 和 `timestamp_uri` 指向同一共享文件。
+当前特征以原生 FP16 存储和读取，时间戳保持 FP64；写入需要 PyArrow 15 或以上版本。
 默认每个特征分片最多约 256 MiB 数组数据，单个超大资产可独占。
 `release.features.read_feature` 同时支持旧 NPY 与新 Parquet 特征。
 manifest 用 `feature_storage`、`package_mode`、`features_bundled` 标记特征布局与打包方式。
 
 缓存采用 SQLite 事务完成标记、内容校验和和固定数量的文件锁，进程退出后锁自动释放。
+音频数值和时间戳在首次生成时检查，缓存命中不再重复扫描；共享文件的指纹复用已有缓存。
 不同资产共享内容和处理配置时复用同一记录；换 MERT 不影响动作缓存，改 Tracker 不重算 GMR。
-正常运行不会留下逐动作 NPZ、JSON 或视频。GMR 和参考质检直接传递数组；只有外部 Tracker 的文件接口
-需要临时输入/rollout，结束后清理。启用诊断时才保留原始 rollout、报告和回放。
+每个 worker 复用 SMPL-X 模型、SONIC 的 MuJoCo 模型和配置，每条动作使用独立仿真状态。人体解码只计算所需的 55 个关节，避免逐帧网格蒙皮；GMR 使用显式 Mink 参数复用关节限位对象。这些优化保持 30 Hz 数据、50 Hz 控制和现有质量策略。
+正常运行不会留下逐动作 NPZ、JSON 或视频。GMR 和参考质检直接传递数组；SONIC 使用临时 rollout，结束后清理。
+启用诊断时才保留原始 rollout、报告和回放。
 显式启用的人物视频裁剪按唯一视频/人物/配置保存媒体和空间时间映射；这类媒体缓存仍按视频保存，
 不会因为同一视频关联多个动作而复制。
 
@@ -114,16 +121,34 @@ manifest 用 `feature_storage`、`package_mode`、`features_bundled` 标记特�
 
 ## 运行与恢复
 
-在 MSC 根目录，使用已安装相应依赖的 Python；本机 GMR/Tracker 使用 `.venv-gmr`。
+从原始 AIST++ 一次完成处理和最终打包（输出目录应尚无已发布 release）：
+
+```bash
+CUDA_VISIBLE_DEVICES=4 .venv/bin/python -m data_pipeline.cli run \
+  --config configs/data_pipeline/aistpp_motion.yaml \
+  --root /home1/gmh/wangyang/motion/data/AISTpp \
+  --output data/processed/audio/aistpp-new --workers 16 --finalize
+```
+
+`--root` 指定原始数据目录。`--finalize` 在发布后把特征写入 release，逐条验证动作和特征，再清除输出目录中的 work、cache 和运行日志；最终只保留 release、config.json 和 summary.json。未完成打包时保留处理缓存以便恢复。原始数据和模型文件不受清理影响。
+
+在 MSC 根目录使用 `.venv/bin/python`。GMR 源码和 G1 资产位于 `third_party/gmr`；SONIC 官方部署源码、配置和 G1 仿真模型位于 `third_party/sonic`，权重在 `model/sonic`。运行时不读取兄弟目录中的 GMR、SONIC 或 OMG 代码；源数据目录仍由配置指定。执行控制为 50 Hz，发布动作保持 30 Hz，首个执行标签对应源时间 `1/30` 秒。
 
 ```bash
 python -m data_pipeline.cli run --config configs/data_pipeline/omg_text.yaml --limit 10 --dry-run
 python -m data_pipeline.cli run --config configs/data_pipeline/omg_text.yaml --limit 10
-python -m data_pipeline.cli run --config configs/data_pipeline/aistpp_motion.yaml --workers 2
+.venv/bin/python -m data_pipeline.cli run --config configs/data_pipeline/aistpp_motion.yaml --workers 16 --diagnostic
 python -m data_pipeline.cli run --config configs/data_pipeline/gdance.yaml --sequence <group-id>
 python -m data_pipeline.cli validate --dataset <output>/release --deep-sample 100
 python -m data_pipeline.cli publish --work <output>/work --out <new-release>
 python -m data_pipeline.cli package --dataset <output>/release --out <bundle> --mode bundle
+python -m data_pipeline.cli package --dataset <output>/release --out <training-bundle> --features-only
+```
+
+模型生成的 `[B,T,125]` 规范动作可直接离线执行。初始状态文件须包含与 batch 对应的 `qpos_36`，它提供规范坐标中缺失的世界高度和航向：
+
+```bash
+.venv/bin/python -m msc.execute --sample .runs/sample.pt --initial-state .runs/initial.npz --config configs/data_pipeline/omg_text.yaml --output .runs/sonic-execution
 ```
 
 `--limit` 按序列计数；GDance 一条序列包含多名演员，共享音频只编码一次。
@@ -134,6 +159,7 @@ python -m data_pipeline.cli package --dataset <output>/release --out <bundle> --
 中断后重跑同一未发布输出会复用内容和配置匹配的缓存，并重新建立当前运行 ledger。
 `publish` 仅读取 ledger 和已有数组，不加载任何处理模型，使用原运行的发布策略。
 普通 Release 的外部特征引用依赖原缓存目录；移动使用 bundle，可整体迁移后验证。
+训练包使用 `--features-only`：动作、特征和时间戳全部放入包内，保留原始媒体的身份、校验和、时长和对齐信息，但不复制 WAV/视频。此时 `assets.uri` 为空，表示未包含原始媒体。
 已有 Release 不会被覆盖。不要在同一 output 上同时启动两个 run/publish；缓存内部允许多 worker 并发。
 
 GDance 首次需要单人索引：

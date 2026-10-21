@@ -33,6 +33,7 @@ def discover(root, *, audio=False, text=True, video=False, sequence=None):
     if not files:
         raise ValueError('OMG episode metadata not found')
     episode_filter = int(sequence.removeprefix('episode-')) if sequence and sequence.startswith('episode-') and sequence.removeprefix('episode-').isdigit() else None
+    shards = {}
     for path in files:
         batches = (pq.read_table(path, filters=[('episode_index', '=', episode_filter)]).to_batches(max_chunksize=2048)
                    if episode_filter is not None else pq.ParquetFile(path).iter_batches(batch_size=2048))
@@ -46,9 +47,12 @@ def discover(root, *, audio=False, text=True, video=False, sequence=None):
                 if split not in ('train', 'val', 'test'):
                     raise ValueError(f'Unknown OMG split for episode {episode}')
                 relative = info['data_path'].format(chunk_index=int(row['data/chunk_index']), file_index=int(row['data/file_index']))
-                motion_path = (root / relative).resolve()
-                if not motion_path.is_relative_to(root) or not motion_path.is_file():
-                    raise ValueError('Missing/unsafe OMG data shard')
+                if relative not in shards:
+                    shard_path = (root / relative).resolve()
+                    if not shard_path.is_relative_to(root) or not shard_path.is_file():
+                        raise ValueError('Missing/unsafe OMG data shard')
+                    shards[relative] = shard_path
+                motion_path = shards[relative]
                 length = int(row['length'])
                 if length < 2 or int(row['dataset_to_index']) - int(row['dataset_from_index']) != length:
                     raise ValueError('Invalid OMG episode range')
@@ -82,11 +86,11 @@ def read_motion(motion):
     pieces = []
     # Global row indices survive file boundaries. Row-group statistics avoid scans.
     index_column = file.schema_arrow.get_field_index('index')
+    st = motion.path.stat()
     for group in range(file.num_row_groups):
         stats = file.metadata.row_group(group).column(index_column).statistics
         if stats is not None and stats.has_min_max and (stats.max < start or stats.min >= end):
             continue
-        st = motion.path.stat()
         table = _row_group(str(motion.path), st.st_mtime_ns, st.st_size, group)
         indices = table['index'].to_numpy()
         selected = np.flatnonzero((indices >= start) & (indices < end))

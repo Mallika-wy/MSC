@@ -21,7 +21,7 @@ class Settings:
     asset_manifest: Path | None = None
 
     @classmethod
-    def read(cls, config, output=None):
+    def read(cls, config, output=None, *, root=None):
         config = Path(config).resolve()
         values = yaml.safe_load(config.read_text())
         def path(value):
@@ -50,7 +50,7 @@ class Settings:
                 raise ValueError('enabled must be a boolean')
         for section, keys, enabled in (
             (retarget, ('gmr_root', 'smpl_model'), dataset != 'omg' and retarget['enabled'] is not False),
-            (tracker, ('onnx',), tracker['enabled']),
+            (tracker, ('sonic_root', 'encoder', 'decoder', 'observation_config'), tracker['enabled']),
             (audio, ('model',), audio['enabled']),
             (video, ('weights',), video['enabled'])):
             if enabled:
@@ -81,7 +81,7 @@ class Settings:
         if release['split_policy'] not in ('preserve', 'song_disjoint'):
             raise ValueError('Invalid split_policy')
         destination = Path(output).resolve() if output else Path(path(release.get('output', 'processed')))
-        root = Path(path(source['root']))
+        root = Path(root).expanduser().resolve() if root is not None else Path(path(source['root']))
         if destination == root or destination.is_relative_to(root) or root.is_relative_to(destination):
             raise ValueError('Output must be outside the source dataset')
         return cls(dataset, root, destination, retarget, tracker, audio, values.get('quality', {}), text, video, release, Path(path(source['asset_manifest'])) if source.get('asset_manifest') else None)

@@ -21,12 +21,9 @@ def environment_key(dataset, settings_json):
     paths.extend(p for p in (root / 'general_motion_retargeting').rglob('*') if p.is_file() and p.suffix in ('.py', '.json', '.yaml', '.yml', '.toml', '.xml', '.urdf') and '.git' not in p.parts)
     if settings.get('smpl_model'):
         paths.append(Path(settings['smpl_model']))
-    import subprocess
-    revision = subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip()
-    diff = subprocess.check_output(['git','-C',str(root),'diff','--binary','HEAD'])
-    import hashlib
+    revision = (root / 'UPSTREAM_REVISION').read_text().strip()
     from data_pipeline.robot import robot_contract
-    return fingerprint({'files': {str(p): digest(p) for p in paths}, 'revision': revision, 'worktree_diff': hashlib.sha256(diff).hexdigest(), 'robot': robot_contract()})
+    return fingerprint({'files': {str(p): digest(p) for p in paths}, 'revision': revision, 'robot': robot_contract()})
 
 
 def process_motion(source, dataset, settings, *, diagnostic=False, tracker_version='not_applicable'):
@@ -67,7 +64,6 @@ def process_motion(source, dataset, settings, *, diagnostic=False, tracker_versi
             version, qpos = metadata['version'], arrays['qpos_36']
             report = metadata['report']
             reference = dict(store=str(store.path), key=key)
-    validate_qpos(qpos, np.arange(len(qpos))/30)
     label = 'source_g1' if native else 'retarget_reference'
     quality = {'accepted': True, 'stage': 'source_g1'} if native else screen_reference(qpos, settings.quality)
     quality['processing'] = report

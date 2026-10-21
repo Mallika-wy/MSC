@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from data_pipeline.audio.processor import AudioCache
 from data_pipeline.tests.test_pipeline import make_wav
@@ -84,3 +85,26 @@ def test_consolidated_audio_cache_invalidation_and_corruption(tmp_path, monkeypa
     assert len(calls)==3 and again==first
     assert len(list(output.glob('*.sqlite')))==1
     assert not list(output.rglob('*.npy'))
+
+
+@pytest.mark.parametrize('invalid', ['values', 'timestamps'])
+def test_invalid_encoder_output_is_not_cached(tmp_path, monkeypatch, invalid):
+    from data_pipeline.audio.mert import MertEncoder
+    from data_pipeline.storage.store import Store
+    model = tmp_path / 'model'
+    model.mkdir()
+    for name in ('pytorch_model.bin', 'config.json', 'preprocessor_config.json'):
+        (model / name).write_bytes(b'synthetic')
+    wav = tmp_path / 'song.wav'
+    make_wav(wav)
+    values = np.ones((3, 8), dtype=np.float16)
+    times = np.arange(3, dtype=np.float64) / 75
+    if invalid == 'values':
+        values[0, 0] = np.nan
+    else:
+        times[1] = times[0]
+    monkeypatch.setattr(MertEncoder, 'encode', lambda *args: (values, times, 1.))
+    with pytest.raises(ValueError, match='Invalid MERT'):
+        AudioCache(model).extract(wav, tmp_path / 'cache')
+    with Store(tmp_path / 'cache/features.sqlite').connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM artifacts').fetchone()[0] == 0

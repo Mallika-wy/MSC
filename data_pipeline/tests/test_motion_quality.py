@@ -68,28 +68,20 @@ def test_invalid_motion_quaternion():
 
 @pytest.mark.parametrize('diagnostic', [False, True])
 def test_tracking_returns_trimmed_arrays_and_only_renders_diagnostics(tmp_path, monkeypatch, diagnostic):
-    import sys
-    from types import ModuleType, SimpleNamespace
-    from data_pipeline.motion import tracking_video
+    from data_pipeline.motion import tracking_video, sonic
     reference = states(31).astype(np.float32)
     sampled = states(50).astype(np.float32)
     xml = tmp_path / 'robot.xml'
     xml.write_text('<mujoco><option timestep="0.002"/><worldbody><body><freejoint/>'
                    '<geom type="sphere" size=".1" mass="1"/></body></worldbody></mujoco>')
     runs, videos = [], []
-    def execute(config):
-        runs.append(config)
-        np.savez(config.output, executed_qpos_36=sampled, reference_qpos_36=sampled,
+    def execute(ref, execution, output):
+        runs.append(execution)
+        np.savez(output, executed_qpos_36=sampled, reference_qpos_36=sampled,
                  fps=50., robot_xml=str(xml))
-    for name in ('omg', 'omg.tracking', 'omg.tracking.holomotion'):
-        module = ModuleType(name); module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setitem(sys.modules, 'omg.tracking.holomotion.reference',
-                        SimpleNamespace(resample_qpos=lambda *args: sampled))
-    monkeypatch.setitem(sys.modules, 'omg.tracking.holomotion.runner',
-                        SimpleNamespace(TrackerRunConfig=SimpleNamespace, run_holomotion_tracker=execute))
+    monkeypatch.setattr(sonic, 'run', execute)
     monkeypatch.setattr(tracking_video, 'save_execution_video', lambda path: videos.append(path))
-    labels, quality = track(reference, {'onnx':'mock'}, {'strict_joint_limits':False},
+    labels, quality = track(reference, {'encoder':'mock'}, {'strict_joint_limits':False},
                             tmp_path / 'work', diagnostic=diagnostic)
     assert len(runs) == 1 and len(videos) == int(diagnostic)
     np.testing.assert_allclose(labels, reference[1:])

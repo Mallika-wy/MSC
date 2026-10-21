@@ -97,6 +97,13 @@ def test_portable_package_and_long_tracks(tmp_path):
     assert report['modality_combinations'] == {'text': 1, 'audio': 1, 'video': 1, 'audio+text+video': 2}
     assert len(list((root / 'motion').glob('*.parquet'))) <= len(inv.motions)
     assert len({a.uri for a in inv.assets}) == 3
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from data_pipeline.release.features import read_feature
+    for feature in inv.features:
+        assert pq.read_schema(root / feature.feature_uri).field('values').type.value_type == pa.float16()
+        values, timestamps = read_feature(root, feature)
+        assert values.dtype == np.float16 and timestamps.dtype == np.float64
     qpos, times = read_motion(root, inv.motions[0])
     np.testing.assert_allclose(times, np.arange(90)/30, atol=1e-12)
     assert qpos.shape == (90, 36)
@@ -110,6 +117,21 @@ def test_portable_package_and_long_tracks(tmp_path):
     reference = tmp_path / 'reference'
     assert not package_release(root, reference, mode='reference')['portable']
     assert validate_release(reference, deep_sample=100)['valid']
+
+
+def test_features_only_package_survives_source_removal(tmp_path):
+    import shutil
+    root = make_fixture(tmp_path / 'source')
+    output = tmp_path / 'features-only'
+    package_release(root, output, include_media=False)
+    shutil.rmtree(root)
+    moved = tmp_path / 'moved-features-only'
+    output.rename(moved)
+    inv = Inventory.read(moved)
+    assert not inv.external_roots
+    assert all(a.uri is None for a in inv.assets)
+    assert not (moved / 'media').exists()
+    assert validate_release(moved, deep_sample=100)['valid']
 
 
 def test_deep_check_catches_corrupt_feature_time(tmp_path):

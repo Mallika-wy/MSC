@@ -21,13 +21,15 @@ def validate_release(root, deep_sample=0):
     import pyarrow as pa
     import pyarrow.parquet as pq
     storage, quality_groups, ranges = {}, {}, {}
+    expected = pa.schema([('qpos36', pa.list_(pa.float32(), 36)), ('timestamp_sec', pa.float64())])
     for m in inv.motions:
         if m.storage_uri not in storage:
             storage[m.storage_uri] = pq.ParquetFile(resolve_uri(root, m.storage_uri, inv.external_roots))
+            if storage[m.storage_uri].schema_arrow != expected:
+                raise ValueError('Motion storage schema mismatch')
         file = storage[m.storage_uri]
-        expected = pa.schema([('qpos36', pa.list_(pa.float32(), 36)), ('timestamp_sec', pa.float64())])
-        if file.schema_arrow != expected or m.row_start + m.num_frames > file.metadata.num_rows:
-            raise ValueError('Motion storage schema/row range mismatch')
+        if m.row_start + m.num_frames > file.metadata.num_rows:
+            raise ValueError('Motion row range mismatch')
         ranges.setdefault(m.storage_uri, []).append((m.row_start, m.row_start+m.num_frames))
         quality_groups.setdefault(m.quality_ref, set()).add(m.motion_id)
     for intervals in ranges.values():
@@ -60,6 +62,8 @@ def validate_release(root, deep_sample=0):
         if (np.sum(qpos[:-1, 3:7] * qpos[1:, 3:7], axis=1) < 0).any():
             raise ValueError('Quaternion sign discontinuity')
     for a in inv.assets[:deep_sample]:
+        if a.uri is None:
+            continue
         source = resolve_uri(root, a.uri, inv.external_roots)
         digest = hashlib.sha256()
         with source.open('rb') as stream:

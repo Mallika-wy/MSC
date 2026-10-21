@@ -6,6 +6,38 @@ from data_pipeline.motion.decoding import HumanMotion
 from data_pipeline.motion.retarget import run_gmr
 
 
+@pytest.mark.parametrize('body_joints', [24, 52])
+def test_smplx_decoding_matches_full_mesh_forward(body_joints):
+    from pathlib import Path
+    import torch
+    from scipy.spatial.transform import Rotation
+    from data_pipeline.motion.decoding import human_motion
+    path = Path(__file__).resolve().parents[2] / 'model/smplx/SMPLX_NEUTRAL.npz'
+    if not path.is_file():
+        pytest.skip('Requires local SMPL-X model')
+    smplx = pytest.importorskip('smplx')
+    count = 65  # One full 64-frame batch followed by a one-frame batch.
+    rng = np.random.default_rng(7)
+    pose = rng.normal(0, .1, (count, body_joints, 3))
+    trans = rng.normal(0, .1, (count, 3)).astype(np.float32)
+    left, right = rng.normal(0, .1, (2, count, 45))
+    model = smplx.SMPLX(model_path=str(path), gender='neutral', use_pca=False, flat_hand_mean=True)
+    for shape in (np.zeros(10), rng.normal(0, .2, 10)):
+        motion = human_motion(pose, trans, shape, left, right, {'smpl_model': str(path)})
+        with torch.no_grad():
+            original = model(betas=torch.tensor(shape).float()[None],
+                global_orient=torch.tensor(pose[:, 0]).float(),
+                body_pose=torch.tensor(pose[:, 1:22]).float().reshape(count, 63),
+                left_hand_pose=torch.tensor(left).float(), right_hand_pose=torch.tensor(right).float(),
+                jaw_pose=torch.zeros(count, 3), leye_pose=torch.zeros(count, 3), reye_pose=torch.zeros(count, 3),
+                expression=torch.zeros(count, model.num_expression_coeffs), transl=torch.from_numpy(trans))
+        expected = Rotation.from_euler('x', 90, degrees=True).apply(original.joints[:, :55].numpy().reshape(-1, 3)).reshape(count, 55, 3)
+        origin = expected[0, 0].copy(); origin[2] = 0
+        expected -= origin
+        np.testing.assert_allclose(motion.positions, expected, atol=2e-6, rtol=1e-6)
+        np.testing.assert_allclose(np.linalg.norm(motion.orientations, axis=-1), 1., atol=1e-6)
+
+
 @pytest.mark.parametrize('gmr_source', ['smplx', 'bvh_lafan1'])
 def test_shared_gmr_stage_preserves_frames_and_jump_height(monkeypatch, gmr_source):
     import mujoco

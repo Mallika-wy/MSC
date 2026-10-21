@@ -59,7 +59,7 @@ def test_omg_cleaned_release_all_splits_and_republish_without_models(tmp_path, m
     import builtins
     original = builtins.__import__
     def guarded(name,*args,**kwargs):
-        if name.startswith(('general_motion_retargeting','mujoco','transformers','omg.tracking')):
+        if name.startswith(('general_motion_retargeting','mujoco','transformers','onnxruntime')):
             raise AssertionError('Disabled heavy dependency imported')
         return original(name,*args,**kwargs)
     monkeypatch.setattr(builtins,'__import__',guarded)
@@ -168,7 +168,9 @@ def test_config_rejects_mixed_and_missing_parent(tmp_path):
     values['dataset']='omg'; config.write_text(yaml.safe_dump(values))
     with pytest.raises(ValueError,match='legacy'):
         Settings.read(config)
-    del values['dataset']; values['motion']={'tracking':{'enabled':True,'onnx':'tracker'}}
+    del values['dataset']; values['motion']={'tracking':{'enabled':True,
+        'sonic_root':'sonic', 'encoder':'encoder.onnx', 'decoder':'decoder.onnx',
+        'observation_config':'observations.yaml'}}
     values['release']['publish_labels']=['tracker_executed']; values['release']['train_default']='tracker_executed'
     config.write_text(yaml.safe_dump(values))
     with pytest.raises(ValueError,match='parent'):

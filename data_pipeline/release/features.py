@@ -9,27 +9,26 @@ def read_feature(root, feature, external_roots=None):
     if path.suffix != '.parquet':
         return (np.load(path, mmap_mode='r', allow_pickle=False),
                 np.load(resolve_uri(root, feature.timestamp_uri, external_roots), allow_pickle=False))
-    rows = pq.read_table(path, filters=[('feature_id', '=', feature.feature_id)]).to_pylist()
-    if len(rows) != 1:
+    table = pq.read_table(path, filters=[('feature_id', '=', feature.feature_id)])
+    if len(table) != 1:
         raise ValueError('Expected exactly one feature row')
-    row = rows[0]
-    if row['shape'] != feature.shape or row['dtype'] != feature.dtype:
+    if table['shape'][0].as_py() != feature.shape or table['dtype'][0].as_py() != feature.dtype:
         raise ValueError('Packed feature metadata mismatch')
-    values = np.asarray(row['values'], dtype=feature.dtype).reshape(feature.shape)
-    times = np.asarray(row['timestamps'], dtype=np.float64).reshape(row['timestamp_shape'])
+    values = table['values'][0].values.to_numpy(zero_copy_only=False).reshape(feature.shape)
+    times = table['timestamps'][0].values.to_numpy(zero_copy_only=False).reshape(table['timestamp_shape'][0].as_py())
     return values, times
 
 
 def feature_schema():
     import pyarrow as pa
     return pa.schema([('feature_id', pa.string()), ('shape', pa.list_(pa.int64())),
-        ('dtype', pa.string()), ('values', pa.large_list(pa.float32())),
+        ('dtype', pa.string()), ('values', pa.large_list(pa.float16())),
         ('timestamps', pa.list_(pa.float64())), ('timestamp_shape', pa.list_(pa.int64()))])
 
 
 def feature_row(identity, values, times):
     return dict(feature_id=identity, shape=list(values.shape), dtype=str(values.dtype),
-                values=values.astype(np.float32).reshape(-1), timestamps=times.reshape(-1),
+                values=values.reshape(-1), timestamps=times.reshape(-1),
                 timestamp_shape=list(times.shape))
 
 

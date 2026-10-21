@@ -1,13 +1,18 @@
 source:
   dataset: omg
-  root: ../../../OMG/data/OMG-Data
+  root: ../../../data/OMG-Data
 motion:
   target_fps: 30
   representation: g1_qpos36
   retarget:
     enabled: auto
   tracking:
-    enabled: false
+    enabled: true
+    sonic_root: ../../third_party/sonic
+    encoder: ../../model/sonic/model_encoder.onnx
+    decoder: ../../model/sonic/model_decoder.onnx
+    observation_config: ../../model/sonic/observation_config.yaml
+    providers: CPUExecutionProvider
 audio:
   enabled: false
 video:
@@ -16,8 +21,8 @@ text:
   enabled: true
 release:
   output: ../../data/processed/omg-text
-  publish_labels: [source_g1]
-  train_default: source_g1
+  publish_labels: [source_g1, tracker_executed]
+  train_default: tracker_executed
   max_shard_frames: 1000000
   split_policy: preserve
   alignment_policy: allow_estimated

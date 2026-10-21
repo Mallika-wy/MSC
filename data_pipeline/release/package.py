@@ -12,7 +12,32 @@ from data_pipeline.io import resolve_uri
 from .validate import validate_release
 
 
-def package_release(root, output, *, mode='bundle'):
+def finalize_output(output):
+    """Keep an independently readable training release and remove processing data."""
+    output = Path(output).resolve()
+    root, staged, previous = output / 'release', output / '.release-bundle', output / '.release-reference'
+    package_release(root, staged, include_media=False)
+    inv = Inventory.read(staged)
+    report = validate_release(staged, deep_sample=max(len(inv.motions), len(inv.features)))
+    (staged / 'reports/dataset_summary.json').write_text(json.dumps(report, indent=2))
+    root.rename(previous)
+    try:
+        staged.rename(root)
+        validate_release(root)
+    except BaseException:
+        if root.exists():
+            root.rename(staged)
+        previous.rename(root)
+        raise
+    for folder in (previous, output / 'cache', output / 'work'):
+        if folder.exists():
+            shutil.rmtree(folder)
+    for filename in ('run.log', 'run.pid', 'sonic-run.log'):
+        (output / filename).unlink(missing_ok=True)
+    return report
+
+
+def package_release(root, output, *, mode='bundle', include_media=True):
     root, output = Path(root).resolve(), Path(output).resolve()
     if mode not in ('bundle', 'reference'):
         raise ValueError('mode must be bundle or reference')
@@ -21,7 +46,7 @@ def package_release(root, output, *, mode='bundle'):
     if output.is_relative_to(root):
         raise ValueError('Package output must be outside source release')
     validate_release(root)
-    inv = Inventory.read(root)
+    inv = Inventory.read(root, validate=False)
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = Path(tempfile.mkdtemp(prefix=f'.{output.name}-', dir=output.parent))
     copied = {}
@@ -67,10 +92,14 @@ def package_release(root, output, *, mode='bundle'):
                 raise ValueError('Reserved external alias package_source')
             roots['package_source'] = str(root)
         for a in inv.assets:
-            uri = copy(a.uri, f'media/{a.modality}') if mode == 'bundle' else (a.uri if a.uri.startswith('root://') else f'root://package_source/{a.uri}')
+            if a.uri is None or not include_media:
+                uri = None
+            else:
+                uri = copy(a.uri, f'media/{a.modality}') if mode == 'bundle' else (a.uri if a.uri.startswith('root://') else f'root://package_source/{a.uri}')
             assets.append(replace(a, uri=uri))
         packaged = replace(inv, motions=motions, assets=assets, features=features, external_roots=roots,
-                           provenance={**inv.provenance, 'package_mode': mode, 'portable': mode == 'bundle'})
+                           provenance={**inv.provenance, 'package_mode': mode, 'portable': mode == 'bundle',
+                                       'media_bundled': mode == 'bundle' and include_media})
         packaged.write(temp, release=True)
         report = validate_release(temp, deep_sample=min(32, max(len(motions), len(features))))
         (temp / 'reports').mkdir(exist_ok=True)

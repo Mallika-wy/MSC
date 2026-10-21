@@ -26,21 +26,24 @@ def make_config(tmp_path, names=('accepted', 'rejected', 'broken')):
     for name in names:
         (raw / 'motions' / f'{name}.pkl').write_bytes(name.encode())
         make_wav(raw / 'wavs' / f'{name}.wav')
-    (tmp_path / 'tracker.onnx').write_bytes(b'synthetic-controller')
     config = tmp_path / 'config.yaml'
     config.write_text(yaml.safe_dump(dict(source=dict(dataset='aistpp', root='raw'),
-        motion=dict(retarget=dict(gmr_root='gmr', smpl_model='smpl.pkl'), tracking=dict(onnx='tracker.onnx')),
+        motion=dict(retarget=dict(gmr_root='gmr', smpl_model='smpl.pkl'),
+                    tracking=dict(sonic_root='sonic', encoder='encoder.onnx',
+                                  decoder='decoder.onnx', observation_config='observations.yaml')),
         release=dict(output='processed'),
         audio=dict(model='mert'))))
     return config
 
 
 @pytest.mark.parametrize('diagnostic', [False, True])
-def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_path, monkeypatch, diagnostic):
-    from data_pipeline.motion import retarget, tracking, arm_twist
+@pytest.mark.parametrize('finalize', [False, True])
+def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_path, monkeypatch, diagnostic, finalize):
+    from data_pipeline.motion import retarget, tracking, arm_twist, sonic
     from data_pipeline.audio import processor as cache
     from data_pipeline.motion import processor as motion
     config = make_config(tmp_path)
+    monkeypatch.setattr(sonic, 'version', lambda _: 'sonic:synthetic')
     qpos = np.zeros((6, 36), dtype=np.float32)
     qpos[:, 0] = np.arange(6) / 30
     qpos[:, 2:4] = [.8, 1.]
@@ -75,7 +78,7 @@ def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_
     monkeypatch.setattr(arm_twist, 'screen_reference', screen)
     monkeypatch.setattr(tracking, 'track', execute)
     monkeypatch.setattr(cache, 'AudioCache', Encoder)
-    summary = run(config, diagnostic=diagnostic)
+    summary = run(config, diagnostic=diagnostic, finalize=finalize)
     assert (summary['accepted'], summary['rejected'], summary['errors']) == (1,1,1)
     assert len(calls) == (2 if diagnostic else 1)
     release = tmp_path / 'processed/release'
@@ -88,6 +91,12 @@ def test_batch_keeps_failures_out_of_release_and_preserves_execution_timing(tmp_
     link = next(l for l in inventory.links if l.motion_id == executed.motion_id)
     assert link.time_offset_sec == pytest.approx(1/30)
     assert link.alignment_status == 'estimated'
+    if finalize:
+        assert not inventory.external_roots
+        assert all(asset.uri is None for asset in inventory.assets)
+        assert not (tmp_path / 'processed/cache').exists()
+        assert not (tmp_path / 'processed/work').exists()
+        return
     from data_pipeline.storage.store import Store
     rows = list(Store(tmp_path / 'processed/work/results.sqlite').results())
     assert rows[1]['motions'][0]['error'] == 'broken source'
@@ -102,6 +111,9 @@ def test_dry_run_lists_real_pairs_without_creating_output(tmp_path):
     assert not (tmp_path / 'processed').exists()
     with pytest.raises(ValueError, match='No matching'):
         run(config, sequence='missing', dry_run=True)
+    relocated = tmp_path / 'other-raw'
+    (tmp_path / 'raw').rename(relocated)
+    assert run(config, root=relocated, dry_run=True)['count'] == 1
 
 
 def _parallel_fake_sequence(source):
@@ -119,7 +131,9 @@ def _parallel_fake_init(*args):
 
 def test_spawn_workers_keep_errors_and_stable_publication_order(tmp_path, monkeypatch):
     from data_pipeline import pipeline
+    from data_pipeline.motion import sonic
     config = make_config(tmp_path)
+    monkeypatch.setattr(sonic, 'version', lambda _: 'sonic:synthetic')
     monkeypatch.setattr(pipeline, '_init_worker', _parallel_fake_init)
     published = []
     def publish(work, output, config):

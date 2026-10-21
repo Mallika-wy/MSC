@@ -37,7 +37,7 @@ class MotionRecord:
 class AssetRecord:
     asset_id: str
     modality: str
-    uri: str
+    uri: str | None
     source_asset_id: str
     checksum: str
     size_bytes: int

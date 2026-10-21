@@ -20,7 +20,6 @@ def track(reference, execution, policy, output, *, diagnostic=False):
     output.mkdir(parents=True, exist_ok=True)
     rollout = output / 'tracker_rollout.npz'
 
-    import mujoco
     import torch
 
     from data_pipeline.motion.quality import (
@@ -28,11 +27,7 @@ def track(reference, execution, policy, output, *, diagnostic=False):
         screen_executed_motion,
     )
     from msc._omg.kinematics import G1Kinematics
-    from omg.tracking.holomotion.reference import resample_qpos
-    from omg.tracking.holomotion.runner import (
-        TrackerRunConfig,
-        run_holomotion_tracker,
-    )
+    from .sonic import run
 
     torch.set_num_threads(4)
 
@@ -41,29 +36,14 @@ def track(reference, execution, policy, output, *, diagnostic=False):
     validate_qpos(ref, times)
     reference_path = output / 'reference.npz'
     np.savez_compressed(reference_path, qpos_36=ref, source_timestamps=times, fps=np.float32(30))
-    # 控制器50Hz执行；每次控制包含10个物理子步，这不是最终标签帧率。
-    run_holomotion_tracker(TrackerRunConfig(
-        reference=reference_path, holomotion_onnx=execution['onnx'],
-        providers=execution.get('providers', 'CPUExecutionProvider'),
-        target_fps=50., control_substeps=10, action_clip=10., output=rollout))
+    run(ref, execution, rollout)
     if diagnostic:
         from .tracking_video import save_execution_video
         save_execution_video(rollout)
 
     with np.load(rollout, allow_pickle=False) as data:
         executed = data['executed_qpos_36'].copy()
-        tracked_ref = data['reference_qpos_36'].copy()
         fps = float(data['fps'])
-        model = mujoco.MjModel.from_xml_path(str(data['robot_xml'].item()))
-
-    dt = float(model.opt.timestep) * 10
-    # 不用文件名判断旧rollout是否可用，而是核对保存的参考采样和控制时间步。
-    if (
-        not np.isclose(dt, 1 / fps)
-        or executed.shape != tracked_ref.shape
-        or not np.array_equal(tracked_ref, resample_qpos(ref, 30, fps))
-    ):
-        raise ValueError('Rollout does not match reference/timing; use a new work directory')
 
     kinematics = G1Kinematics()
     # 跌倒的“连续帧数”必须在原控制频率上统计，不能先降到30Hz再数。

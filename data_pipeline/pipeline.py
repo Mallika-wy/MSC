@@ -11,7 +11,7 @@ import wave
 from data_pipeline.config import Settings
 from data_pipeline.io import sha256_file, write_json
 from data_pipeline.sources import discover
-from data_pipeline.storage.store import Store
+from data_pipeline.storage.store import Store, digest
 
 _worker_context = None
 
@@ -53,7 +53,7 @@ def process_sequence(sequence, settings, tracker_version, diagnostic=False, audi
             if not getattr(settings, asset.modality, {}).get('enabled', False):
                 continue
             entry = dict(source_id=asset.asset_id, path=str(asset.path), modality=asset.modality,
-                         checksum=sha256_file(asset.path))
+                         checksum=digest(asset.path))
             if asset.modality == 'audio':
                 artifact = process_audio(asset, audio_encoder, settings.output / 'cache/audio')
                 entry['feature'] = asdict(artifact)
@@ -61,7 +61,7 @@ def process_sequence(sequence, settings, tracker_version, diagnostic=False, audi
                     entry.update(duration_sec=wav.getnframes()/wav.getframerate(), sample_rate_hz=wav.getframerate())
             elif asset.modality == 'video':
                 crop = process_video(asset, settings.output / 'cache/video', settings.video)
-                entry.update(path=crop['video'], checksum=sha256_file(crop['video']),
+                entry.update(path=crop['video'], checksum=digest(crop['video']),
                              duration_sec=crop['frames']/crop['fps'], frame_rate=crop['fps'],
                              camera_id=asset.metadata.get('camera_id'), person_track_id=str(crop['track_id']))
                 for alignment in sequence_record['alignments']:
@@ -93,12 +93,12 @@ def publish_work(work, output, config=None):
     return ReleaseBuilder(output, config).publish(Store(work / 'results.sqlite').results())
 
 
-def run(config, *, limit=None, sequence=None, output=None, dry_run=False, diagnostic=False, workers=1):
+def run(config, *, limit=None, sequence=None, root=None, output=None, dry_run=False, diagnostic=False, workers=1, finalize=False):
     if type(workers) is not int or workers < 1:
         raise ValueError('workers must be a positive integer')
     if limit is not None and (type(limit) is not int or limit < 1):
         raise ValueError('limit must be positive')
-    settings = Settings.read(config, output)
+    settings = Settings.read(config, output, root=root)
     sequences = discover(settings.dataset, settings.root, audio=settings.audio['enabled'],
                          text=settings.text['enabled'], video=settings.video['enabled'], sequence=sequence)
     if settings.asset_manifest is not None:
@@ -117,7 +117,8 @@ def run(config, *, limit=None, sequence=None, output=None, dry_run=False, diagno
         return dict(dataset=settings.dataset, output=str(settings.output), count=len(samples), workers=workers, samples=samples)
     if (settings.output / 'release').exists():
         raise FileExistsError('Release already exists; select a new --output directory')
-    tracker_version = 'holomotion:' + sha256_file(settings.tracker['onnx']) if settings.tracker['enabled'] else 'not_applicable'
+    from data_pipeline.motion.sonic import version as sonic_version
+    tracker_version = sonic_version(settings.tracker) if settings.tracker['enabled'] else 'not_applicable'
     settings.output.mkdir(parents=True, exist_ok=True)
     write_json(settings.output / 'config.json', json.loads(json.dumps(asdict(settings), default=str)))
     ledger = Store(settings.output / 'work/results.sqlite')
@@ -171,4 +172,8 @@ def run(config, *, limit=None, sequence=None, output=None, dry_run=False, diagno
     release = publish_work(settings.output / 'work', settings.output / 'release', settings.release)
     summary = dict(dataset=settings.dataset, **counts, release=release)
     write_json(settings.output / 'summary.json', summary)
+    if finalize:
+        from data_pipeline.release.package import finalize_output
+        summary['release'] = finalize_output(settings.output)
+        write_json(settings.output / 'summary.json', summary)
     return summary
