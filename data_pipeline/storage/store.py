@@ -37,8 +37,8 @@ class Store:
 
     @contextmanager
     def lock(self, key):
-        # Fixed lock stripes keep file count bounded even for millions of keys.
-        stripe = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) % 32
+        # Fixed stripes bound file count while reducing collisions between workers.
+        stripe = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) % 256
         with self.path.with_suffix(f'.lock-{stripe:02d}').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             yield

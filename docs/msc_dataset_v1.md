@@ -33,6 +33,8 @@ motion:
     encoder: ../../model/sonic/model_encoder.onnx
     decoder: ../../model/sonic/model_decoder.onnx
     observation_config: ../../model/sonic/observation_config.yaml
+    providers: CUDAExecutionProvider
+    inference_batch_size: 32
 audio: {enabled: false}
 video: {enabled: false}
 text: {enabled: true}
@@ -153,6 +155,18 @@ python -m data_pipeline.cli package --dataset <output>/release --out <training-b
 
 `--limit` 按序列计数；GDance 一条序列包含多名演员，共享音频只编码一次。
 `--workers` 使用 spawn，完成顺序不影响发布顺序。演员失败单独记录，其他合格演员仍可发布。
+OMG 的 GPU 配置由父进程中的共享推理线程合并请求；例如 64 个仿真 worker 共用 batch=32 的 SONIC 模型，保留每个 worker 独立的物理状态和历史。GPU 使用 FP32 并禁用 TF32；批量导出副本写入可清理的 cache，原始权重不变。CPU 配置不设置 `inference_batch_size`。
+
+GPU 环境安装 `onnxruntime-gpu` 和 `onnx`，不要同时保留 CPU/GPU 两个 ONNX Runtime 包。当前环境已配置，可直接运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m data_pipeline.cli run \
+  --config configs/data_pipeline/omg_text.yaml \
+  --root /home1/gmh/wangyang/motion/data/OMG-Data \
+  --workers 64 --resume --finalize
+```
+
+`--resume` 在同一原始数据集、同一输出目录内保留已完成序列和原有版本信息，只处理未完成及处理报错的序列。切换 CPU/GPU 后，旧结果保留真实版本，新计算使用新的 tracker 版本。
 `--diagnostic` 可执行被参考质检拒绝的动作供检查，但不会发布该动作。
 处理错误或演员错误使 CLI 返回非零状态；普通质检拒绝保留统计。
 

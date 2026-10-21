@@ -1,5 +1,6 @@
 """Discover sequences, process independent modalities, and assemble one release."""
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import ExitStack
 from dataclasses import asdict
 from itertools import islice
 import json
@@ -20,8 +21,15 @@ def _record(value):
     return json.loads(json.dumps(asdict(value), default=str))
 
 
-def _init_worker(settings, tracker_version, diagnostic):
+def _init_worker(settings, tracker_version, diagnostic, inference=None):
     global _worker_context
+    from data_pipeline.motion import sonic
+    if inference is not None:
+        from data_pipeline.motion.inference import connect_worker
+        sonic._shared_policy = connect_worker(inference, settings.tracker['observation_config'])
+    else:
+        sonic._shared_policy = None
+    sonic.load_policy.cache_clear()
     encoder = None
     if settings.audio['enabled']:
         from data_pipeline.audio.processor import AudioCache
@@ -93,7 +101,7 @@ def publish_work(work, output, config=None):
     return ReleaseBuilder(output, config).publish(Store(work / 'results.sqlite').results())
 
 
-def run(config, *, limit=None, sequence=None, root=None, output=None, dry_run=False, diagnostic=False, workers=1, finalize=False):
+def run(config, *, limit=None, sequence=None, root=None, output=None, dry_run=False, diagnostic=False, workers=1, finalize=False, resume=False):
     if type(workers) is not int or workers < 1:
         raise ValueError('workers must be a positive integer')
     if limit is not None and (type(limit) is not int or limit < 1):
@@ -122,9 +130,17 @@ def run(config, *, limit=None, sequence=None, root=None, output=None, dry_run=Fa
     settings.output.mkdir(parents=True, exist_ok=True)
     write_json(settings.output / 'config.json', json.loads(json.dumps(asdict(settings), default=str)))
     ledger = Store(settings.output / 'work/results.sqlite')
-    with ledger.connect() as db:
-        db.execute('DELETE FROM results')
     counts = dict(total=0, accepted=0, rejected=0, errors=0, partial=0, motion_errors=0)
+    completed_names = set()
+    if resume:
+        for result in ledger.results():
+            if result['state'] != 'error' and not any(m['state'] == 'error' for m in result.get('motions', [])):
+                completed_names.add(result['name'])
+                counts['total'] += 1
+                counts[result['state']] += 1
+    else:
+        with ledger.connect() as db:
+            db.execute('DELETE FROM results')
     seen = set()
     result_buffer = []
     def checked():
@@ -134,7 +150,8 @@ def run(config, *, limit=None, sequence=None, root=None, output=None, dry_run=Fa
             if settings.video['enabled'] and not any(a.modality == 'video' for a in source.assets):
                 raise ValueError('Video enabled but source has no declared video assets/alignments')
             seen.add(source.sequence_id)
-            yield ordinal, source
+            if source.sequence_id not in completed_names:
+                yield ordinal, source
     def record(ordinal, result):
         result_buffer.append((result['name'], ordinal, result))
         counts['total'] += 1
@@ -145,27 +162,35 @@ def run(config, *, limit=None, sequence=None, root=None, output=None, dry_run=Fa
             result_buffer.clear()
             write_json(settings.output / 'work/progress.json', counts)
     try:
-        if workers == 1:
-            _init_worker(settings, tracker_version, diagnostic)
-            for ordinal, source in checked():
-                record(ordinal, _worker_process(source))
-        else:
-            # Bounded submission avoids retaining all episodes/futures in memory.
-            with ProcessPoolExecutor(max_workers=workers, mp_context=get_context('spawn'), initializer=_init_worker,
-                                     initargs=(settings, tracker_version, diagnostic)) as pool:
-                iterator = iter(checked()); pending = {}
-                exhausted = False
-                while pending or not exhausted:
-                    while not exhausted and len(pending) < 2*workers:
-                        try:
-                            ordinal, source = next(iterator)
-                        except StopIteration:
-                            exhausted = True; break
-                        pending[pool.submit(_worker_process, source)] = ordinal
-                    if pending:
-                        completed, _ = wait(pending, return_when=FIRST_COMPLETED)
-                        for future in completed:
-                            record(pending.pop(future), future.result())
+        with ExitStack() as resources:
+            inference = None
+            if settings.tracker['enabled'] and settings.tracker.get('inference_batch_size', 1) > 1:
+                from data_pipeline.motion.inference import SharedPolicy
+                inference = resources.enter_context(SharedPolicy(settings.tracker, workers, settings.output / 'cache/policy'))
+            state = inference.worker_state if inference is not None else None
+            if workers == 1:
+                _init_worker(settings, tracker_version, diagnostic, state)
+                for ordinal, source in checked():
+                    record(ordinal, _worker_process(source))
+            else:
+                # Bounded submission avoids retaining all episodes/futures in memory.
+                with ProcessPoolExecutor(max_workers=workers, mp_context=get_context('spawn'), initializer=_init_worker,
+                                         initargs=(settings, tracker_version, diagnostic, state)) as pool:
+                    iterator = iter(checked()); pending = {}
+                    exhausted = False
+                    while pending or not exhausted:
+                        if inference is not None and inference.failed.is_set():
+                            raise RuntimeError('Shared SONIC GPU inference failed')
+                        while not exhausted and len(pending) < 2*workers:
+                            try:
+                                ordinal, source = next(iterator)
+                            except StopIteration:
+                                exhausted = True; break
+                            pending[pool.submit(_worker_process, source)] = ordinal
+                        if pending:
+                            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                            for future in completed:
+                                record(pending.pop(future), future.result())
     finally:
         ledger.record_many(result_buffer)
     write_json(settings.output / 'work/progress.json', counts)

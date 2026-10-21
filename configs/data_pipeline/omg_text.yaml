@@ -12,7 +12,8 @@ motion:
     encoder: ../../model/sonic/model_encoder.onnx
     decoder: ../../model/sonic/model_decoder.onnx
     observation_config: ../../model/sonic/observation_config.yaml
-    providers: CPUExecutionProvider
+    providers: CUDAExecutionProvider
+    inference_batch_size: 32
 audio:
   enabled: false
 video:

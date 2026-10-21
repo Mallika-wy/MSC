@@ -43,6 +43,7 @@ def test_cached_robot_starts_each_motion_from_fresh_state(tmp_path):
     from data_pipeline.motion.sonic import DEFAULT, run
     root = Path(__file__).resolve().parents[2]
     settings = Settings.read(root / 'configs/data_pipeline/omg_text.yaml')
+    settings.tracker['providers'] = 'CPUExecutionProvider'
     if not Path(settings.tracker['decoder']).is_file():
         pytest.skip('Requires local SONIC weights')
     pytest.importorskip('onnxruntime')

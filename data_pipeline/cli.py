@@ -12,6 +12,7 @@ def main():
     run.add_argument('--config', type=Path, required=True)
     run.add_argument('--root', type=Path, help='Override the raw source dataset directory')
     run.add_argument('--finalize', action='store_true', help='Bundle motion and features, validate all payloads, and remove work/cache')
+    run.add_argument('--resume', action='store_true', help='Keep completed sequences from the existing work ledger')
     run.add_argument('--limit', type=int)
     run.add_argument('--workers', type=int, default=1, help='Independent sample processes (default: 1)')
     run.add_argument('--sequence', help='Sequence ID or motion ID')
@@ -51,7 +52,7 @@ def main():
     if args.command == 'run':
         from data_pipeline.pipeline import run
         result = run(args.config, limit=args.limit, sequence=args.sequence, root=args.root, output=args.output,
-                     dry_run=args.dry_run, diagnostic=args.diagnostic, workers=args.workers, finalize=args.finalize)
+                     dry_run=args.dry_run, diagnostic=args.diagnostic, workers=args.workers, finalize=args.finalize, resume=args.resume)
     elif args.command == 'publish':
         from data_pipeline.pipeline import publish_work
         result = publish_work(args.work, args.out) or {'published': False}

@@ -43,6 +43,8 @@ ENCODER_DIMS = dict(encoder_mode_4=4, motion_joint_positions_10frame_step5=290,
     vr_3point_local_orn_target=12, smpl_joints_10frame_step1=720,
     smpl_anchor_orientation_heading_10frame_step1=60, motion_joint_positions_wrists_10frame_step1=60)
 
+_shared_policy = None
+
 
 def version(execution):
     root = Path(execution['sonic_root'])
@@ -51,6 +53,8 @@ def version(execution):
     files = [Path(__file__), source, root / 'gear_sonic/utils/mujoco_sim/wbc_configs/g1_29dof_sonic_model12.yaml',
              *sorted(scene.rglob('*.xml')),
              *(Path(execution[key]) for key in ('encoder', 'decoder', 'observation_config'))]
+    if execution.get('inference_batch_size', 1) > 1:
+        files.append(Path(__file__).with_name('inference.py'))
     return 'sonic:' + fingerprint({str(path): digest(path) for path in files})
 
 
@@ -111,11 +115,15 @@ def decoder_observation(token, history, observations):
 
 @lru_cache(maxsize=2)
 def load_policy(encoder, decoder, observation_config, providers):
+    if _shared_policy is not None:
+        return _shared_policy
     import onnxruntime as ort
     options = ort.SessionOptions()
     options.intra_op_num_threads = 2
     options.inter_op_num_threads = 1
-    sessions = [ort.InferenceSession(path, sess_options=options, providers=providers.split(','))
+    providers = [(name, {'use_tf32': False}) if name == 'CUDAExecutionProvider' else name
+                 for name in providers.split(',')]
+    sessions = [ort.InferenceSession(path, sess_options=options, providers=providers)
                 for path in (encoder, decoder)]
     return *sessions, yaml.safe_load(Path(observation_config).read_text())
 

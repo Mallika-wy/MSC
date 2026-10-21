@@ -29,7 +29,7 @@ def track(reference, execution, policy, output, *, diagnostic=False):
     from msc._omg.kinematics import G1Kinematics
     from .sonic import run
 
-    torch.set_num_threads(4)
+    torch.set_num_threads(1 if execution.get('inference_batch_size', 1) > 1 else 4)
 
     ref = np.asarray(reference, dtype=np.float32)
     times = np.arange(len(ref), dtype=np.float64) / 30

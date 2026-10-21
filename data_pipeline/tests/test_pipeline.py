@@ -145,6 +145,32 @@ def test_spawn_workers_keep_errors_and_stable_publication_order(tmp_path, monkey
     assert [r['name'] for r in published] == ['accepted','broken','rejected']
 
 
+def test_resume_keeps_completed_results_and_retries_errors(tmp_path, monkeypatch):
+    from data_pipeline import pipeline
+    from data_pipeline.motion import sonic
+    from data_pipeline.storage.store import Store
+    config = make_config(tmp_path)
+    monkeypatch.setattr(sonic, 'version', lambda _: 'sonic:first')
+    monkeypatch.setattr(pipeline, '_init_worker', lambda *args: None)
+    monkeypatch.setattr(pipeline, '_worker_process', _parallel_fake_sequence)
+    monkeypatch.setattr(pipeline, 'publish_work', lambda *args: None)
+    first = pipeline.run(config)
+    assert (first['accepted'], first['rejected'], first['errors']) == (1, 1, 1)
+    calls = []
+    def recovered(source):
+        calls.append(source.sequence_id)
+        result = _parallel_fake_sequence(source)
+        result['state'] = 'accepted'
+        return result
+    monkeypatch.setattr(sonic, 'version', lambda _: 'sonic:second')
+    monkeypatch.setattr(pipeline, '_init_worker', lambda *args: None)
+    monkeypatch.setattr(pipeline, '_worker_process', recovered)
+    second = pipeline.run(config, resume=True)
+    assert calls == ['broken']
+    assert (second['total'], second['accepted'], second['rejected'], second['errors']) == (3, 2, 1, 0)
+    assert len(list(Store(tmp_path / 'processed/work/results.sqlite').results())) == 3
+
+
 @pytest.mark.parametrize('workers', [0,-1,True,1.5])
 def test_invalid_worker_count(workers):
     with pytest.raises(ValueError, match='workers'):
