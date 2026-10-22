@@ -1,0 +1,47 @@
+model:
+  hidden_dim: 512
+  num_layers: 6
+  num_heads: 8
+  ffn_dim: 2048
+  text_backend: precomputed
+  text_cache_dir: null # Set after running msc.cache_text.
+  condition:
+    fusion: token_cross_attention
+    temporal_bias: relative_distance
+    history_dropout: 0.0
+    text: {enabled: true, backend: t5, frozen: true, dim: auto, dropout: 0.1}
+    audio: {enabled: true, backend: mert_v1_95m, frozen: true, dim: 768, dropout: 0.1}
+    video: {enabled: false, backend: vjepa, frozen: true, dim: auto, spatial_tokens: 4, dropout: 0.1}
+  losses:
+    flow: 1.0
+    joint_velocity: 0.05
+    joint_acceleration: 0.01
+    dynamic_normalization: train_stats
+    dynamic_warmup_steps: 1000
+  dynamic_stats_path: null # Required for real training with dynamics enabled.
+  rtc: false
+data:
+  backend: msc_release
+  roots: [/path/to/text/release, data/processed/audio/aistpp/release]
+  split: train
+  label_policy: train_default
+  alignment_policy: allow_estimated
+  audio_context_sec: 0.25
+  video_context_sec: 0.25
+  cache_bytes: 134217728
+  task_weights: {text: 0.5, audio: 0.5, video: 0.0}
+  num_workers: 4
+train:
+  device: cuda:0
+  precision: bf16
+  batch_size: 8
+  accumulation_steps: 2
+  learning_rate: 0.0001
+  warmup_steps: 1000
+  schedule_steps: 100000
+  steps: 100000
+  validation_every: 100
+  validation_batches: 4
+  checkpoint_every: 1000
+  log_every: 10
+  output_dir: .runs/trimodal-release

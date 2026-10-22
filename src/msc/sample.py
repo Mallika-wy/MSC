@@ -14,11 +14,24 @@ def load_model(checkpoint, device="cpu", t5_path=None):
     # The actual normalization buffers travel in the checkpoint. Sampling does
     # not need the original custom statistics file to remain on disk.
     cfg.model.stats_path = None
-    model = build_model(cfg, obj["metadata"]["audio"])
+    cfg.model.dynamic_stats_path = None
+    model = build_model(cfg, obj["metadata"]["audio"],obj['metadata'].get('features'))
+    if t5_path and cfg.data.backend == 'msc_release':
+        from msc.models.conditioning.text import T5TextEncoder
+        encoder = T5TextEncoder(t5_path,frozen=True,max_length=cfg.model.text_max_length)
+        expected = (obj['metadata'].get('features') or {}).get('text')
+        if not expected or encoder.fingerprint != expected['checkpoint_hash'] or encoder.output_dim != expected['output_dim'] or encoder.max_length != expected['max_length']:
+            raise ValueError('Local T5 differs from frozen feature cache provenance')
+        # Offline checkpoints contain adapters only; attach the optional frozen encoder after loading.
+    else:
+        encoder = None
     if model.text_encoder and model.text_encoder.fingerprint != obj["metadata"]["text_model_sha256"]:
         raise ValueError("Local T5 does not match checkpoint")
     model.load_state_dict(obj["model"])
+    if encoder is not None:
+        model.text_encoder = encoder
     model.representation.stats_sha256 = obj["metadata"]["representation"]["stats_sha256"]
+    model.dynamic_stats_sha256 = obj['metadata'].get('dynamic_stats_sha256')
     return model.to(device).eval(), cfg, obj["metadata"]
 
 
@@ -29,6 +42,8 @@ def main():
     p.add_argument("--synthetic-history", action="store_true")
     p.add_argument("--text")
     p.add_argument("--audio", help=".pt dict: features, mask, metadata matching the checkpoint")
+    p.add_argument('--text-tokens',help='.pt dict: tokens, mask, encoder metadata')
+    p.add_argument('--video',help='.pt dict: tokens, mask, intervals, feature metadata')
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--cfg-scale", type=float, default=1.0)
     p.add_argument("--previous-motion", help="Tensor .pt [B,30,125] from the previous generated chunk")
@@ -57,7 +72,17 @@ def main():
     kwargs = {}
     if args.audio:
         audio = torch.load(args.audio, map_location=args.device, weights_only=True)
-        kwargs = dict(audio=audio["features"], audio_mask=audio["mask"], audio_metadata=audio["metadata"])
+        kwargs = dict(audio=audio.get('tokens',audio.get('features')), audio_mask=audio["mask"], audio_times=audio['times'],audio_metadata=audio["metadata"])
+    if args.text_tokens:
+        text = torch.load(args.text_tokens,map_location=args.device,weights_only=True)
+        if text['metadata'] != (metadata.get('features') or {}).get('text'):
+            raise ValueError('Text feature provenance differs from checkpoint')
+        kwargs.update(text_features=text['tokens'],text_mask=text['mask'])
+    if args.video:
+        video = torch.load(args.video,map_location=args.device,weights_only=True)
+        if video['metadata'] != metadata.get('features'):
+            raise ValueError('Video feature provenance differs from checkpoint')
+        kwargs.update(video_tokens=video['tokens'],video_mask=video['mask'],video_intervals=video['intervals'])
     previous_motion = (torch.load(args.previous_motion, map_location="cpu", weights_only=True)
                        if args.previous_motion else None)
     motion = model.sample(history.to(args.device), text=args.text, num_steps=args.steps,
@@ -69,6 +94,8 @@ def main():
     if not torch.isfinite(motion).all():
         raise FloatingPointError("Nonfinite sample")
     output = Path(args.output)
+    if any(output.resolve().is_relative_to(Path(root).resolve()) for root in cfg.data.roots):
+        p.error('Sample output must be outside read-only Release roots')
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(dict(motion=motion.cpu(), metadata=metadata, seed=args.seed), output)
     print(f"Saved {list(motion.shape)} canonical motion to {output}")

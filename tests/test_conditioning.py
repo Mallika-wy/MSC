@@ -15,10 +15,6 @@ def test_modalities(model, batch, text, audio):
 
 def test_masked_condition_values_irrelevant(model, batch):
     model.eval()
-    # Nonzero FiLM makes this test sensitive to actual audio leakage.
-    with torch.no_grad():
-        for layer in model.motion_generator.layers:
-            layer.audio_film[-1].weight.normal_(std=0.05)
     x, t = torch.randn(4, 30, 125), torch.rand(4)
     expected = model(x, t, batch)
     changed = dict(batch)
@@ -29,9 +25,6 @@ def test_masked_condition_values_irrelevant(model, batch):
 
 def test_zero_audio_is_not_missing(model, batch):
     model.eval()
-    with torch.no_grad():
-        for layer in model.motion_generator.layers:
-            layer.audio_film[-1].bias.fill_(0.5)
     batch["audio_features"].zero_()
     batch["audio_mask"].fill_(True)
     x, t = torch.randn(4, 30, 125), torch.rand(4)
@@ -48,6 +41,6 @@ def test_audio_provenance_rejected(model, batch):
 
 
 def test_all_condition_dropout(model, batch):
-    model.text_dropout = model.audio_dropout = model.history_dropout = 1.0
+    model.condition_bridge.dropouts.update(text=1.,audio=1.)
     loss = model.compute_loss(batch)
     assert torch.isfinite(loss)

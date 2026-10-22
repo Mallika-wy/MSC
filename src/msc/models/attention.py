@@ -1,4 +1,4 @@
-# Adapted from OMG (MIT), commit 510bc0d. See THIRD_PARTY.md.
+# Source attribution and licenses: see THIRD_PARTY.md.
 from __future__ import annotations
 import math
 import torch

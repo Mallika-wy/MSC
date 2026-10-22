@@ -14,7 +14,7 @@ text = ["transformers>=4.40,<5", "sentencepiece>=0.2", "safetensors"]
 data = ["datasets>=2.19", "pyarrow>=14"]
 pipeline = ["pyarrow>=15", "scipy>=1.10", "transformers>=4.40,<5", "onnxruntime>=1.18", "mujoco>=3.3,<4", "smplx>=0.1.28", "mink>=1.0", "qpsolvers>=4", "daqp>=0.8", "rich>=13", "natsort>=8", "opencv-python>=4"]
 pipeline-gpu = ["onnxruntime-gpu>=1.23,<2", "onnx>=1.19"]
-test = ["pytest>=8"]
+test = ["pytest>=8", "pyarrow>=15"]
 
 [project.scripts]
 msc-train = "msc.train:main"
@@ -38,4 +38,4 @@ msc = ["assets/stats/*.json", "assets/robots/g1/*.json", "assets/robots/g1/*.urd
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: requires local OMG data and T5 assets", "slow: synthetic convergence test"]
+markers = ["integration: requires local MSC Releases or T5 assets", "slow: synthetic convergence test"]

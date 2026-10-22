@@ -1,4 +1,4 @@
-# Adapted from OMG (MIT), commit 510bc0d. See THIRD_PARTY.md.
+# Source attribution and licenses: see THIRD_PARTY.md.
 from __future__ import annotations
 
 import json
@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from msc._omg.rotation_conversions import (
+from msc.motion.rotations import (
     axis_angle_to_matrix,
     euler_angles_to_matrix,
     matrix_to_quaternion,

@@ -8,15 +8,15 @@ import torch
 
 from data_pipeline.config import Settings
 from data_pipeline.motion.tracking import track
-from msc._omg.feature_codec import G1MotionFeatureCodec
-from msc._omg.kinematics import G1Kinematics
+from msc.motion.codec import G1MotionFeatureCodec
+from msc.motion.kinematics import G1Kinematics
 
 
 def main():
     parser = argparse.ArgumentParser(description='Execute sampled 30 Hz motion with SONIC')
     parser.add_argument('--sample', required=True, help='msc-sample output .pt with motion [B,T,125]')
     parser.add_argument('--initial-state', required=True, help='NPZ qpos_36 [36] or [B,36] at the history anchor')
-    parser.add_argument('--config', default='configs/data_pipeline/omg_text.yaml')
+    parser.add_argument('--config', default='configs/data_pipeline/aistpp_motion.yaml')
     parser.add_argument('--output', required=True)
     parser.add_argument('--diagnostic', action='store_true')
     args = parser.parse_args()

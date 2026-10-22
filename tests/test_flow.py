@@ -1,6 +1,7 @@
 import pytest
 import torch
 from msc.models.flow_matching import FlowMatching
+from msc.models.conditioning.fusion import ConditionMemory
 
 
 @pytest.mark.parametrize("steps", [1, 10, 37])
@@ -10,7 +11,7 @@ def test_euler_direction_and_endpoint(steps):
     def oracle(x, t, conditions, valid_mask=None):
         seen.append(t[0].item())
         return noise - data
-    out = FlowMatching().sample(oracle, {"context": torch.zeros(2, 1, 8)},
+    out = FlowMatching().sample(oracle, ConditionMemory(torch.zeros(2,1,8),torch.ones(2,1,dtype=torch.bool),torch.zeros(2,1),torch.zeros(2,1,2),torch.zeros(2,1,dtype=torch.long)),
                                initial_noise=noise, num_steps=steps)
     torch.testing.assert_close(out, data, atol=1e-5, rtol=1e-5)
     assert len(seen) == steps
@@ -34,15 +35,8 @@ def test_loss_and_gradient(model, batch):
     loss.backward()
     assert torch.isfinite(loss)
     assert model.motion_generator.output.weight.grad.abs().sum() > 0
-    assert model.text_adapter.weight.grad.abs().sum() > 0
-    # FiLM is deliberately zero-initialized: adapter gradients begin after FiLM updates.
-    assert model.motion_generator.layers[0].audio_film[-1].weight.grad.abs().sum() > 0
-    with torch.no_grad():
-        for p in model.parameters():
-            if p.grad is not None:
-                p.add_(p.grad, alpha=-0.001)
-    model.zero_grad(set_to_none=True)
-    model.compute_loss(batch).backward()
+    assert model.text_adapter[1].weight.grad.abs().sum() > 0
+    assert model.motion_generator.layers[0].key.weight.grad.abs().sum() > 0
     assert model.audio_adapter[1].weight.grad.abs().sum() > 0
 
 

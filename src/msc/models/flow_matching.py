@@ -1,4 +1,4 @@
-"""Linear flow, t=1 noise -> t=0 data; adapted from local OMG Flow (MIT)."""
+"""Linear flow, t=1 noise -> t=0 data; source attribution and licenses in THIRD_PARTY.md."""
 import torch
 
 
@@ -8,9 +8,14 @@ class FlowMatching:
     action_dim = 125
 
     def loss(self, generator, data, conditions, mask, *, noise=None, times=None,
-             rtc_training=False, max_delay=8, delays=None):
+             rtc_training=False, max_delay=8, delays=None, return_details=False):
         data = data.float().masked_fill(~mask[..., None], 0)
         noise = torch.randn_like(data) if noise is None else noise.float()
+        if noise.shape != data.shape:
+            raise ValueError('noise must match [B,30,125] data')
+        noise = noise.masked_fill(~mask[...,None],0)
+        if not torch.isfinite(noise).all():
+            raise ValueError('Valid flow noise contains NaN/Inf')
         if times is None:
             times = torch.rand(data.shape[0], device=data.device)
         if times.shape not in {(data.shape[0],), data.shape[:2]}:
@@ -44,7 +49,10 @@ class FlowMatching:
         error = (velocity.float() - target).square().mean(-1).masked_fill(~loss_mask, 0)
         if not loss_mask.any(-1).all():
             raise ValueError("Cannot compute loss on an empty motion")
-        return (error.sum(-1) / loss_mask.sum(-1)).mean()
+        loss = (error.sum(-1) / loss_mask.sum(-1)).mean()
+        if return_details:
+            return dict(loss=loss, x_tau=x, tau=times, pred_velocity=velocity, mask=loss_mask)
+        return loss
 
     @torch.no_grad()
     def sample(self, generator, conditions, *, num_steps=10, initial_noise=None,
@@ -53,7 +61,7 @@ class FlowMatching:
             raise ValueError("num_steps must be a positive integer")
         if not torch.isfinite(torch.tensor(cfg_scale)):
             raise ValueError("cfg_scale must be finite")
-        ref = conditions["context"]
+        ref = conditions.tokens
         shape = (ref.shape[0], self.horizon, self.action_dim)
         x = torch.randn(shape, device=ref.device) if initial_noise is None else initial_noise.to(ref.device).float().clone()
         if x.shape != shape or not torch.isfinite(x).all():
@@ -70,7 +78,7 @@ class FlowMatching:
         return x
 
     def _validate_rtc_inputs(self, conditions, previous_actions, inference_delay, execution_horizon=None):
-        ref = conditions["context"]
+        ref = conditions.tokens
         b, horizon, action_dim = ref.shape[0], self.horizon, self.action_dim
         previous_actions = previous_actions.to(ref.device).float()
         if previous_actions.shape != (b, horizon, action_dim) or not torch.isfinite(previous_actions).all():

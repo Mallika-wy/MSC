@@ -1,4 +1,4 @@
-# Adapted from OMG (MIT), commit 510bc0d. See THIRD_PARTY.md.
+# Source attribution and licenses: see THIRD_PARTY.md.
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause AND Apache-2.0

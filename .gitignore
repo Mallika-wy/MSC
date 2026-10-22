@@ -5,7 +5,7 @@ __pycache__/
 .venv/
 .venv-gmr/
 .runs/
-data/
+/data/
 model/
 build/
 dist/

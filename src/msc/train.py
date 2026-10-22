@@ -12,7 +12,7 @@ def main():
     cfg = load_config(args.config, args.overrides)
     seed_everything(cfg.train.seed)
     dataset = build_dataset(cfg)
-    model = build_model(cfg, dataset.audio_metadata)
+    model = build_model(cfg, dataset.audio_metadata, getattr(dataset,"feature_metadata",None))
     Trainer(model, dataset, cfg).fit()
 
 

@@ -26,7 +26,7 @@ def track(reference, execution, policy, output, *, diagnostic=False):
         MotionScreeningConfig,
         screen_executed_motion,
     )
-    from msc._omg.kinematics import G1Kinematics
+    from msc.motion.kinematics import G1Kinematics
     from .sonic import run
 
     torch.set_num_threads(1 if execution.get('inference_batch_size', 1) > 1 else 4)

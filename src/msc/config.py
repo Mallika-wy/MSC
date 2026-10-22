@@ -1,12 +1,21 @@
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
+import math
 import yaml
 
 
 @dataclass
 class ModelConfig:
     hidden_dim: int = 512
-    num_layers: int = 12
+    num_layers: int = 6
+    ffn_dim: int | None = None
+    representation: str = 'g1_canonical_125d'
+    fps: int = 30
+    history_frames: int = 5
+    future_frames: int = 30
+    condition: dict = field(default_factory=dict)
+    losses: dict = field(default_factory=lambda: dict(joint_velocity=.05,joint_acceleration=.01,dynamic_warmup_steps=1000))
+    dynamic_stats_path: str | None = None
     num_heads: int = 8
     dropout: float = 0.1
     text_dim: int = 768
@@ -19,7 +28,7 @@ class ModelConfig:
     text_cache_dir: str | None = None
     text_dropout: float = 0.1
     audio_dropout: float = 0.1
-    history_dropout: float = 0.1
+    history_dropout: float = 0.0
     # Psi0-style RTC training is opt-in: it can bias a generator toward
     # continuing its previous chunk, so ordinary motion training keeps it off.
     rtc: bool = False
@@ -35,11 +44,21 @@ class DataConfig:
     size: int = 32
     limit_size: int | None = None
     num_workers: int = 0
+    roots: list[str] = field(default_factory=list)
+    label_policy: str = 'train_default'
+    alignment_policy: str = 'allow_estimated'
+    audio_context_sec: float = .25
+    video_context_sec: float = .25
+    cache_bytes: int = 134217728
+    task_weights: dict = field(default_factory=lambda: dict(text=.5,audio=.5,video=0.))
+    max_motions_per_task: int | None = None
+    max_windows_per_motion: int | None = None
 
 
 @dataclass
 class TrainConfig:
     seed: int = 42
+    deterministic: bool = True
     device: str = "cpu"
     precision: str = "fp32"
     steps: int = 10
@@ -55,6 +74,9 @@ class TrainConfig:
     output_dir: str = ".runs/smoke"
     resume: str | None = None
     num_threads: int = 2
+    validation_every: int = 100
+    validation_batches: int = 4
+    validation_motions_per_task: int | None = None
 
 
 @dataclass
@@ -65,16 +87,59 @@ class Config:
 
     def validate(self):
         m, d, t = self.model, self.data, self.train
-        if d.backend not in {"synthetic", "omg"} or m.text_backend not in {"synthetic", "t5"}:
+        if d.backend not in {"synthetic", "msc_release"} or m.text_backend not in {"synthetic", "t5", "precomputed"}:
             raise ValueError("Unknown data or text backend")
-        if d.backend == "omg" and not d.root:
-            raise ValueError("data.root is required for OMG; downloads are disabled")
-        if d.backend == "omg" and m.use_text and m.text_backend != "t5":
-            raise ValueError("Real captions require the T5 backend")
-        if m.use_text and m.text_backend == "t5" and not m.t5_path:
+        if m.use_text and m.text_backend == "t5" and not m.t5_path and d.backend != 'msc_release':
             raise ValueError("model.t5_path is required for local T5")
         if m.text_cache_dir and not m.freeze_text:
             raise ValueError("Text cache requires frozen T5")
+        if not m.freeze_text:
+            raise ValueError('Trimodal encoder training is disabled')
+        if (m.representation,m.fps,m.history_frames,m.future_frames) != ('g1_canonical_125d',30,5,30):
+            raise ValueError('Only canonical G1 125D / 30 FPS / history 5 / future 30 is supported')
+        if d.backend == 'msc_release' and not d.roots:
+            raise ValueError('data.roots must identify published Releases')
+        if d.split not in {'train','val','test'}:
+            raise ValueError('data.split must be train/val/test')
+        if d.alignment_policy not in {'allow_estimated','verified_only'}:
+            raise ValueError('Unknown alignment policy')
+        if d.cache_bytes < 0 or min(d.audio_context_sec,d.video_context_sec) < 0:
+            raise ValueError('Cache/context must be nonnegative')
+        if set(d.task_weights)-{'text','audio','video','motion_only'} or any(not isinstance(v,(int,float)) or not math.isfinite(v) or v<0 for v in d.task_weights.values()) or sum(d.task_weights.values())<=0:
+            raise ValueError('Invalid task weights')
+        if m.condition.get('temporal_bias','relative_distance') not in {'none','relative_distance'}:
+            raise ValueError('Unknown temporal bias')
+        if m.condition.get('history_dropout',m.history_dropout) != 0:
+            raise ValueError('History dropout must be zero')
+        if m.condition.get('fusion','token_cross_attention') != 'token_cross_attention':
+            raise ValueError('Only token_cross_attention is supported')
+        if set(m.condition)-{'fusion','temporal_bias','history_dropout','text','audio','video'}:
+            raise ValueError('Unknown condition configuration key')
+        for name in ('text','audio','video'):
+            c = m.condition.get(name,{})
+            if set(c)-{'enabled','backend','frozen','dim','dropout','spatial_tokens'}:
+                raise ValueError(f'Unknown {name} condition configuration key')
+            if c.get('frozen',True) is not True or not 0 <= c.get('dropout',.1) <= 1:
+                raise ValueError('Encoders must be frozen with valid condition dropout')
+            if c.get('enabled',{'text':m.use_text,'audio':m.use_audio,'video':False}[name]) is False and d.backend=='msc_release' and d.task_weights.get(name,0)>0:
+                raise ValueError(f'{name} task is sampled but its adapter is disabled')
+        if m.condition.get('audio',{}).get('dim',768) != 768:
+            raise ValueError('Audio dimension must be 768 for MERT')
+        if any(m.losses.get(k,0) != 0 for k in ('foot_contact','root_dynamics','fk_consistency')) or m.losses.get('flow',1.) != 1.:
+            raise ValueError('Only unchanged FM plus joint dynamics losses are supported')
+        if set(m.losses)-{'flow','joint_velocity','joint_acceleration','dynamic_normalization','dynamic_warmup_steps','foot_contact','root_dynamics','fk_consistency'}:
+            raise ValueError('Unknown loss configuration key')
+        if any(not math.isfinite(m.losses.get(k,0)) or m.losses.get(k,0)<0 for k in ('joint_velocity','joint_acceleration','dynamic_warmup_steps')):
+            raise ValueError('Loss weights/warmup must be nonnegative')
+        if not isinstance(m.losses.get('dynamic_warmup_steps',1000),int):
+            raise ValueError('Dynamic warmup must count integer optimizer steps')
+        if m.losses.get('dynamic_normalization','train_stats') != 'train_stats':
+            raise ValueError('Dynamics require train_stats normalization')
+        for value in (m.ffn_dim,d.max_motions_per_task,d.max_windows_per_motion,t.validation_motions_per_task):
+            if value is not None and (not isinstance(value,int) or value<=0):
+                raise ValueError('Optional dimensions/subset limits must be positive integers')
+        if t.validation_every<0 or t.validation_batches<1:
+            raise ValueError('Invalid validation intervals/batch count')
         if t.precision not in {"fp32", "bf16", "fp16"}:
             raise ValueError("precision must be fp32, bf16 or fp16")
         for value in (m.hidden_dim, m.num_layers, m.num_heads, m.text_dim, m.text_max_length,
@@ -107,6 +172,9 @@ def load_config(path, overrides=()):
     raw = yaml.safe_load(Path(path).read_text()) or {}
     for override in overrides:
         key, value = override.split("=", 1)
-        section, name = key.split(".", 1)
-        raw.setdefault(section, {})[name] = yaml.safe_load(value)
+        names = key.split('.')
+        target = raw
+        for name in names[:-1]:
+            target = target.setdefault(name,{})
+        target[names[-1]] = yaml.safe_load(value)
     return Config.from_dict(raw)

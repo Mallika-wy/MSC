@@ -21,8 +21,10 @@ def model_fingerprint(path):
     return digest.hexdigest()
 
 
-class TextAdapter(nn.Linear):
-    pass
+class TextAdapter(nn.Sequential):
+    def __init__(self,input_dim,output_dim=512):
+        super().__init__(nn.LayerNorm(input_dim),nn.Linear(input_dim,output_dim),
+                         nn.SiLU(),nn.Linear(output_dim,output_dim))
 
 
 class T5TextEncoder(nn.Module):

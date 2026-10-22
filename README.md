@@ -1,230 +1,115 @@
-# MSC
+# MSC: shared trimodal flow action expert
 
-MSC is a small, independent PyTorch research baseline for multimodal G1 motion generation. It uses the official OMG 125D canonical motion contract and linear flow matching, with separate text and audio adapters.
+MSC v2 generates canonical G1 motion with a shared action expert conditioned on
+frozen T5, MERT and V-JEPA features. Motion remains **canonical G1 125D, 30 FPS, 5 history
+frames and 30 future frames**. Encoders are frozen; the trainable model consists
+of independent modality adapters, a history adapter and six shared action blocks.
 
-The package does not import Psi0 or OMG at runtime, download model weights/data, implement video, or provide robot deployment. The included `_omg` files are the minimum source-derived closure needed for the official data adapter, representation and attention; see [THIRD_PARTY.md](THIRD_PARTY.md).
+Training reads published MSC Releases and offline features. It never writes to
+Data Pipeline inputs, work directories or Releases. Video currently has synthetic
+interface coverage; real V-JEPA features and three-task results are **Pending**.
 
-The [data pipeline guide](docs/msc_dataset_v1.md) covers the shared audio-motion pipeline for
-AIST++, FineDance and GDance: GMR, MuJoCo execution videos, MERT features and native release export.
-Start with `data_pipeline/pipeline.py`; each source dataset has its own folder.
-The dataset-centric pipeline also imports the locally cleaned OMG text-motion release into shared Parquet shards. Video feature extraction and unified training integration remain pending.
+Motion geometry and canonical conversion live in `msc.motion` (`codec`,
+`kinematics`, `rotations`); attention components live in `msc.models.attention`.
+The representation identifier is `g1_canonical_125d`. Only newly trained
+checkpoint format version 3 is supported; old checkpoints are not migrated.
+Source/license attribution is retained in `THIRD_PARTY.md`.
 
-## Install
+Implementation, milestone acceptance, measured results and remaining prerequisites:
+[trimodal implementation report](docs/trimodal_implementation.md).
+Dataset and existing SONIC documentation: [MSC v1 dataset](docs/msc_dataset_v1.md).
 
-Recommended on this machine: reuse the existing OMG environment. No dependency installation is necessary for the verified commands:
-
-```bash
-source /home1/gmh/wangyang/motion/OMG/.venv/bin/activate
-export PYTHONPATH="$PWD/src"
-python -m msc.train --config configs/smoke.yaml
-```
-
-The Python dependencies can also come from a compatible Psi0 environment (PyTorch 2.3+). This shares the environment only, not source imports. An independent installation was also verified; that temporary environment has been removed.
-
-For a new machine, use Python 3.10+ and a PyTorch build appropriate for the hardware:
+## Environment and smoke checks
 
 ```bash
-python -m venv .venv
 source .venv/bin/activate
-pip install -e '.[test]'
-# Only for local frozen T5: pip install -e '.[text]'
-# Only for a local official OMG release: pip install -e '.[data]'
-```
-
-No command downloads data or weights. Set paths to assets already on disk.
-
-## Synthetic smoke training
-
-```bash
-PYTHONPATH=src python -m msc.train --config configs/smoke.yaml
-PYTHONPATH=src python -m msc.sample --checkpoint .runs/smoke/last.pt --synthetic-history
-```
-
-For a convergence check:
-
-```bash
-PYTHONPATH=src python -m pytest -m slow -q
-```
-
-The smoke model is intentionally small. `configs/overfit.yaml` uses a larger model and verifies that a four-sample synthetic set can be fitted.
-
-## Official OMG data
-
-Point `configs/omg.yaml` at a local release and a local T5 directory:
-
-```bash
-PYTHONPATH=src python -m msc.train --config configs/omg.yaml \
-  data.root=/path/to/OMG-Data model.t5_path=/path/to/t5-base-local \
-  train.device=cuda:0
-PYTHONPATH=src python -m msc.evaluate --checkpoint .runs/omg/last.pt \
-  --data-root /path/to/OMG-Data --split val --t5-path /path/to/t5-base-local
-```
-
-The adapter expects the pinned `THU-MARS/OMG-Data` release metadata and manifest. It reads `omg.audio.feature` directly as `[T,35]` and preserves `omg.condition.has_audio`; the official metadata does not state whether those values came from `current35` or `aistpp_librosa35`, so the checkpoint records `feature_type: unknown` and never re-extracts audio.
-
-## Sampling
-
-A history tensor is a local `.pt` file shaped `[B,5,125]` in OMG canonical feature coordinates. It contains four preceding frames and the current frame; MSC predicts the following 30 frames:
-
-```bash
+# For a new environment: pip install -e '.[data,text,test]'
+PYTHONPATH=src python -m pytest tests -q -m 'not integration'
+PYTHONPATH=src python -m msc.train --config configs/smoke.yaml \
+  train.steps=2 train.output_dir=.runs/trimodal-smoke
 PYTHONPATH=src python -m msc.sample \
-  --checkpoint .runs/omg/last.pt \
-  --history history.pt --steps 10 --output sample.pt \
-  --t5-path /path/to/t5-base-local
+  --checkpoint .runs/trimodal-smoke/last.pt --synthetic-history \
+  --output .runs/trimodal-smoke/sample.pt
 ```
 
-Pass `--text "walk forward"` for text conditioning and `--audio audio.pt` for audio conditioning. Both flags can be used together.
+The default real model has 6 blocks, width 512, 8 heads and FFN width 2048.
+`model.condition` configures the independent adapters and temporal attention bias.
+`model.losses` configures joint velocity/acceleration residual supervision.
+History stays valid in dropout and CFG null branches. Checkpoints use architecture
+`trimodal_flow_v2`, checkpoint version 3, and reject older weights.
 
-### Real-time chunking
+## Prepare frozen text and training statistics
 
-MSC includes the two Psi0-style RTC paths. Training RTC is deliberately off by
-default (`model.rtc=false`), because clean-prefix training can bias a model toward
-continuing the previous chunk. Set `model.rtc=true model.max_delay=8` only for a
-dedicated RTC checkpoint. That checkpoint can use hard frozen-prefix sampling:
+Supply a **published** Text Release, a local T5 checkpoint and the Audio Release.
+The Text pipeline's work/cache directories are not training datasets.
 
 ```bash
-PYTHONPATH=src python -m msc.sample --checkpoint .runs/rtc/last.pt \
-  --history history.pt --previous-motion prior_chunk.pt \
-  --rtc-mode train --rtc-delay 4
+PYTHONPATH=src python -m msc.cache_text \
+  --t5-path /path/to/local-t5 --release-root /path/to/text/release \
+  --cache-dir .runs/trimodal-t5-cache --device cuda:1
+PYTHONPATH=src python -m msc.data.stats \
+  --config configs/trimodal_release.yaml \
+  --output .runs/trimodal-dynamics-stats.json \
+  model.text_cache_dir=.runs/trimodal-t5-cache
+PYTHONPATH=src python -m msc.train --config configs/trimodal_release.yaml \
+  model.text_cache_dir=.runs/trimodal-t5-cache \
+  model.dynamic_stats_path=.runs/trimodal-dynamics-stats.json \
+  train.device=cuda:1
 ```
 
-A normal checkpoint can instead use Psi0's test-time PiGDM/VJP guidance, which
-keeps the training distribution unchanged:
+Set `data.roots` in the config to the actual Releases before running these commands.
+Statistics use only the configured Train Split and selected official label. Recompute
+them when the selected data/window pools change. Training from precomputed tokens
+does not load T5, MERT or V-JEPA weights.
+
+Missing features, missing valid task windows, ambiguous labels, wrong fingerprints
+and cross-split source/song leakage produce explicit errors. Shared songs cannot
+be moved between splits by the training code.
+
+## Controlled short experiments
 
 ```bash
-PYTHONPATH=src python -m msc.sample --checkpoint .runs/omg/last.pt \
-  --history history.pt --previous-motion prior_chunk.pt \
-  --rtc-mode test_time --rtc-delay 4 --rtc-execution-horizon 12
+PYTHONPATH=src python -m msc.training.experiments \
+  --config configs/trimodal_audio_overfit.yaml \
+  --output .runs/trimodal-audio-short \
+  --sonic-config configs/data_pipeline/aistpp_motion.yaml
 ```
 
-`prior_chunk.pt` is an unnormalized canonical `[B,30,125]` motion tensor. The
-train RTC path freezes its first `rtc-delay` rows exactly. Test-time RTC uses the
-paper's exponential overlap mask by default; `--rtc-mask-schedule` and
-`--rtc-guidance-alpha` expose its schedule and strength. The caller must shift
-the previously generated chunk by the actions already executed and pad its tail
-before passing it as `prior_chunk.pt`.
+The runner performs 200 GPU optimizer steps per available task. When real train
+and validation pools are available, it runs three 1000-step arms: FM, FM+velocity,
+and FM+velocity+acceleration. The latter two enable auxiliary supervision after
+100 optimizer steps. Arms share initialization, task/window sequence, flow noise,
+tau and evaluation seeds; the report records initialization and sampler hashes.
+CPU-only runs report the full experiment as Pending.
 
-Audio is a `.pt` dictionary containing `features [B,30,35]`, `mask [B,30]`, and the exact metadata dictionary stored in the checkpoint. Audio row `i` conditions predicted motion row `i`. Text is one caption per sample. Sampling writes canonical `[B,30,125]` motion and checkpoint metadata.
+The current AIST++ Release contains Train only; independent validation comparisons
+remain Pending. Previous training outputs have been removed. Train fresh checkpoints
+with the current native implementation before sampling or evaluation.
 
-## Tests
+## Sampling and evaluation
 
-Fast tests cover representation shapes, mask semantics, flow direction, multimodal branches, optimizer steps, checkpoint/resume, and sampling:
+An Audio input `.pt` contains `tokens [B,L,768]`, `times [B,L]`, `mask [B,L]`
+and `metadata` matching checkpoint audio provenance. Text token inputs contain
+`tokens`, `mask`, `metadata`; Video inputs contain `tokens [B,L,K,D]`, `intervals
+[B,L,2]`, `mask [B,L,K]`, and checkpoint feature `metadata`. Times are relative
+to the future window start. Use `--t5-path` for optional live frozen text encoding
+from a compatible offline checkpoint.
 
 ```bash
-PYTHONPATH=src python -m pytest -q -m 'not slow and not integration'
+PYTHONPATH=src python -m msc.sample --checkpoint /path/to/last.pt \
+  --history /path/to/history.pt --audio /path/to/audio.pt \
+  --device cuda:1 --output .runs/trimodal-sample.pt
+PYTHONPATH=src python -m msc.execute --sample .runs/trimodal-sample.pt \
+  --initial-state /path/to/anchor-qpos36.npz \
+  --config configs/data_pipeline/aistpp_motion.yaml --output .runs/trimodal-execution
+PYTHONPATH=src python -m msc.evaluate --checkpoint /path/to/last.pt \
+  --split val --device cuda:1 --output .runs/trimodal-evaluation \
+  --sonic-config configs/data_pipeline/aistpp_motion.yaml --rollout-chunks 3
 ```
 
-Opt-in local integration tests use the existing assets without downloads:
+Evaluation records per-task losses, physical dynamic residuals, motion amplitudes,
+root motion, FK MPJPE, Jerk, chunk boundaries and matched/shuffled/missing-condition
+controls. Continuous rollouts re-anchor generated history and can run the existing
+SONIC tracker. Condition sensitivity alone does not establish semantic alignment.
 
-```bash
-MSC_TEST_DATA_ROOT=/path/to/OMG-Data \
-MSC_TEST_T5_PATH=/path/to/t5-base-local \
-MSC_TEST_OMG_SOURCE=/path/to/OMG \
-PYTHONPATH=src python -m pytest tests/test_integration.py -q
-```
-
-The tests validate data/codec numerical parity and one real training/sample step. They do not claim motion quality; that requires a full training run and domain evaluation.
-
-## Current boundaries
-
-Implemented: future-only linear flow matching, G1 125D normalization/codec, history conditioning, frozen or trainable local T5, cached text tokens, precomputed OMG audio, audio mask/dropout, text/audio/combined conditions, single-process BF16/AMP, checkpoint/resume, synthetic and official OMG data adapters.
-
-Reserved for later: video encoder, RTC serving/runtime, distributed training, physical losses, robotics deployment, low-level tracking policies, new audio extraction, and old OMG checkpoint conversion.
-
-## Structure and interfaces
-
-```text
-MSC/
-├── configs/                  # smoke, overfit, real OMG
-├── src/msc/
-│   ├── models/               # DiT, flow, representation, MSCModel
-│   │   └── conditioning/     # T5/TextAdapter, AudioAdapter, encoder protocol
-│   ├── data/                 # synthetic, OMG adapter, collator
-│   ├── training/             # trainer, atomic checkpoint/RNG state
-│   ├── _omg/                 # attributed source-derived numeric/data primitives
-│   ├── assets/               # statistics, kinematics JSON, URDF
-│   ├── config.py, factory.py
-│   └── train.py, sample.py, evaluate.py, cache_text.py
-├── tests/                    # unit, convergence, opt-in integration
-├── licenses/, THIRD_PARTY.md
-└── TEST_RESULTS.md
-```
-
-`MSCModel.compute_loss(batch)` returns a scalar differentiable loss. Batch fields:
-`motion_history [B,5,125]` (four historical frames plus the current frame),
-`motion_future [B,30,125]`, `motion_mask [B,30]`, optional `text: list[str]`,
-`has_text [B]`, `audio_features [B,30,35]`, and `audio_mask [B,30]`. For
-pre-encoded text, pass `text_features [B,L,text_dim]`
-and `text_mask [B,L]`; static text features are rejected when T5 is trainable.
-The synthetic backend provides synthetic tokens, not language embeddings.
-
-All external motion tensors are **unnormalized OMG canonical 125D**. The current
-frame is history index 4 and is the canonical anchor for the following 30 frames,
-with OMG's joint/link order and row-based rot6d convention. The data adapter constructs this contract;
-external callers must do the same. Flow velocity and integration operate in
-normalized space. Returned motion is denormalized canonical features; it is not
-world coordinates and does not enforce joint limits or FK consistency.
-
-The public velocity call is `model(noisy_future, time, batch)` with continuous
-`time [B]` in `[0,1]`. The generator embeds `1000*time`. Training uses
-`x_t=(1-t)*data+t*noise`, target `noise-data`; sampling runs exactly N Euler steps
-from noise at `t=1` to data at `t=0`. Joint CFG uses `base+s*(conditioned-base)`;
-`base` keeps the same history and drops both text/audio. `--cfg-scale` defaults
-to 1. No physical auxiliary losses or diffusion scheduler are included.
-
-The defaults are a 512-wide, 12-layer, 8-head model. Smoke uses width 64 for fast
-shape/engineering checks. Overfit uses width 256: a 64-wide bottleneck cannot
-faithfully reconstruct arbitrary 125D Gaussian velocity targets.
-
-## Resume, text caching and operational details
-
-```bash
-python -m msc.train --config configs/smoke.yaml \
-  train.resume=.runs/smoke/last.pt train.steps=20
-
-python -m msc.cache_text --t5-path /path/to/t5-base-local \
-  --captions captions.txt --cache-dir .runs/t5-cache
-
-python -m msc.train --config configs/omg.yaml \
-  data.root=/path/to/OMG-Data model.t5_path=/path/to/t5-base-local \
-  model.text_cache_dir=.runs/t5-cache
-```
-
-Cache files contain FP32 tokens before the trainable adapter and token masks.
-They are keyed by the actual local model/tokenizer files, text and max length;
-cache misses are computed locally. Only the explicit caching command writes
-cache files. Frozen T5 stays in eval mode; set `model.freeze_text=false` and leave
-`model.text_cache_dir=null` to train it.
-
-Training logs go to `metrics.jsonl`; `config.json` and `metadata.json` capture the
-run contract. `last.pt` is written atomically at the checkpoint interval and final
-optimizer step, and contains model (including T5 if configured), optimizer,
-scheduler, scaler, RNG, configuration, data release identity, audio provenance
-and normalization buffers. Load only trusted checkpoints. Resume preserves the
-sampling sequence and rejects incompatible architecture, preprocessing and
-optimizer settings; `train.steps` is the desired total completed steps. The
-cosine horizon is the separate `train.schedule_steps`, so extending a smoke run
-does not silently change its schedule. Exact resume is verified on CPU with zero
-data workers; CUDA kernels need not be bitwise deterministic.
-
-The single-process trainer samples fixed OMG windows uniformly with replacement,
-using per-microbatch seeds rather than a permutation of the complete release.
-`data.limit_size` limits early episodes and returned windows for a quick local
-smoke test; it is not a balanced modality subset. The integration suite explicitly
-selects known audio/no-audio/short episodes. The first real-data run can create
-Hugging Face Arrow caches, but never downloads the release. The full official
-release is large; materialized-cache acceleration and DDP are deferred.
-
-Use `train.precision=bf16` or `fp16` on supported CUDA devices, and `fp32` on CPU.
-`train.accumulation_steps` counts microbatches per optimizer update. Nonfinite loss
-or gradients raise an error instead of being silently logged as successful steps.
-
-For audio inference, copy the checkpoint's `metadata.audio` dictionary into the
-input file and provide features **from that same release**, not re-extracted WAV
-features. Unknown extractor identity permits the pinned release only; it does
-not make arbitrary unknown 35D features interchangeable. Changing any stored
-provenance field is rejected.
-
-Future extensions should start with validated motion-quality metrics and longer
-real training, then streaming/RTC against this explicit history interface. See
-`TEST_RESULTS.md` for the executed checks and their limits.
+Third-party source attribution and licensing is documented in [THIRD_PARTY.md](THIRD_PARTY.md).

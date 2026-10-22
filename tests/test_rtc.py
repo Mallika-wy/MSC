@@ -2,10 +2,11 @@ import pytest
 import torch
 
 from msc.models.flow_matching import FlowMatching
+from msc.models.conditioning.fusion import ConditionMemory
 
 
 def _conditions(batch=2):
-    return {"context": torch.zeros(batch, 1, 8)}
+    return ConditionMemory(torch.zeros(batch,1,8),torch.ones(batch,1,dtype=torch.bool),torch.zeros(batch,1),torch.zeros(batch,1,2),torch.zeros(batch,1,dtype=torch.long))
 
 
 def test_rtc_training_loss_freezes_prefix_and_excludes_it():

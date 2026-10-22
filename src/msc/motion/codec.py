@@ -1,4 +1,4 @@
-# Adapted from OMG (MIT), commit 510bc0d. See THIRD_PARTY.md.
+# Source attribution and licenses: see THIRD_PARTY.md.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,8 +6,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from msc._omg.kinematics import G1Kinematics
-from msc._omg.rotation_conversions import (
+from msc.motion.kinematics import G1Kinematics
+from msc.motion.rotations import (
     axis_angle_to_quaternion,
     matrix_to_quaternion,
     matrix_to_rotation_6d,

@@ -1,11 +1,14 @@
 import copy
+import pytest
 import torch
 from msc.factory import seed_everything, build_model, build_dataset
 from msc.training.trainer import Trainer
 from msc.training.checkpoint import load_checkpoint
 
 
-def test_checkpoint_resume_matches_continuous(cfg, tmp_path):
+@pytest.mark.parametrize('accumulation',[1,2])
+def test_checkpoint_resume_matches_continuous(cfg, tmp_path,accumulation):
+    cfg.train.accumulation_steps=accumulation
     cfg.train.steps = 3
     cfg.train.output_dir = str(tmp_path / "continuous")
     seed_everything(cfg.train.seed)

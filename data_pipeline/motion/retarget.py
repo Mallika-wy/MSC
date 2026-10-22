@@ -42,7 +42,7 @@ def run_gmr(motion: HumanMotion, settings):
     solver_class = load_gmr(settings['gmr_root'])
     import mujoco
     import torch
-    from msc._omg.kinematics import G1Kinematics
+    from msc.motion.kinematics import G1Kinematics
     solver = solver_class(src_human=motion.gmr_source, tgt_robot='unitree_g1',
         actual_human_height=motion.height_m, verbose=False, use_velocity_limit=False)
     names = [mujoco.mj_id2name(solver.model, mujoco.mjtObj.mjOBJ_JOINT, i)
