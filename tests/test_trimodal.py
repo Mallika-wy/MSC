@@ -9,16 +9,17 @@ import pyarrow.parquet as pq
 from data_pipeline.tests.fixtures import fixture_records
 from data_pipeline.release.export import export_release
 from data_pipeline.schema.manifest import Inventory
-from data_pipeline.io import sha256_file
-from msc.data.release_dataset import ReleaseDataset, audit_splits, fingerprint
+from msc.data.release_dataset import ReleaseDataset
+from data_pipeline.release.validate import audit_splits
 from msc.data.collator import collate_motion
 from msc.data.temporal import select_tokens
 from msc.models.conditioning.fusion import ConditionMemory
 from msc.models.losses import dynamics_loss, joint_dynamics
 from msc.models.msc_model import MSCModel
-from msc.training.trainer import StepBatchSampler, Trainer
+from msc.training.trainer import EpochBatchSampler, Trainer
 from msc.factory import build_model, build_dataset, seed_everything
-from msc.config import load_config
+from msc.config import Config, load_config
+from conftest import ToyDataset
 
 
 @pytest.fixture
@@ -40,19 +41,6 @@ def release(tmp_path):
     return root
 
 
-def cached_text(root,cache):
-    cache.mkdir()
-    identity = dict(output_dim=32,checkpoint_hash='synthetic',preprocess='fixture')
-    manifest = dict(version=2,encoder=identity,entries={},checksums={})
-    for a in Inventory.read(root).annotations:
-        name = fingerprint(a.text)+'.pt'
-        torch.save(dict(encoder=identity,text=a.text,features=torch.arange(96).reshape(3,32).float()/96,mask=torch.ones(3,dtype=torch.bool)),cache/name)
-        manifest['entries'][fingerprint(a.text)] = name
-        manifest['checksums'][name] = sha256_file(cache/name)
-    (cache/'manifest.json').write_text(json.dumps(manifest))
-    return cache
-
-
 def test_window_io_parity_and_determinism(release,monkeypatch):
     import msc.data.release_dataset as module
     reads = []
@@ -72,7 +60,7 @@ def test_window_io_parity_and_determinism(release,monkeypatch):
         reads.append(record)
         return original(root,record)
     monkeypatch.setattr(module,'read_motion',reader)
-    data = ReleaseDataset([release],task_weights={'audio':1},cache_bytes=0)
+    data = ReleaseDataset([release],tasks=['audio'],cache_bytes=0)
     item = data[5]
     other = data[5]
     assert all(x.num_frames == 35 for x in reads)
@@ -93,16 +81,15 @@ def test_window_io_parity_and_determinism(release,monkeypatch):
     assert data.cache.size==0
 
 
-def test_tasks_masks_and_real_feature_shapes(release,tmp_path):
-    cache = cached_text(release,tmp_path/'text-cache')
-    data = ReleaseDataset([release],task_weights={'text':1,'audio':1,'video':1},text_cache_dir=cache)
-    samples = [data[data.task_ranges[t][0][0]] for t in ('text','audio','video')]
+def test_tasks_masks_and_real_feature_shapes(release):
+    data = ReleaseDataset([release],tasks=['audio', 'video'])
+    samples = [data[data.task_ranges[t][0][0]] for t in ('audio','video')]
     batch = collate_motion(samples)
     assert batch['audio_tokens'].shape[-1]==768
     assert batch['video_tokens'].shape[-2:]==(2,6)
-    assert not batch['audio_mask'][0].any()
-    assert batch['audio_mask'][1].any()
-    model = MSCModel(hidden_dim=32,num_layers=1,num_heads=4,text_dim=32,video_dim=6,spatial_tokens=2,
+    assert batch['audio_mask'][0].any()
+    assert not batch['audio_mask'][1].any()
+    model = MSCModel(hidden_dim=32,num_layers=1,num_heads=4,use_text=False,video_dim=6,spatial_tokens=2,
                      text_dropout=0,audio_dropout=0,video_dropout=0)
     memory = model.encode_conditions(batch)
     assert isinstance(memory,ConditionMemory)
@@ -110,7 +97,7 @@ def test_tasks_masks_and_real_feature_shapes(release,tmp_path):
     null = memory.null()
     assert null.mask[:,:5].all() and not null.mask[:,5:].any()
     video = memory.modality_ids==3
-    actual = memory.temporal_support[video].reshape(3,-1,2,2)
+    actual = memory.temporal_support[video].reshape(2,-1,2,2)
     torch.testing.assert_close(actual[:,:,0],actual[:,:,1])
     loss = model.compute_loss(batch)
     loss.backward()
@@ -119,13 +106,12 @@ def test_tasks_masks_and_real_feature_shapes(release,tmp_path):
 
 
 def test_missing_video_rejected(release):
-    inv = Inventory.read(release)
-    inv.features = [f for f in inv.features if 'video' not in f.encoder_name]
-    # Mutate only in-memory test inventory, never real Release data.
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(Inventory,'read',lambda *a,**k: inv)
-        with pytest.raises(ValueError,match='No valid video'):
-            ReleaseDataset([release],task_weights={'video':1})
+    from data_pipeline.release.training_index import build_training_index
+    table = pq.read_table(release/'meta/features.parquet')
+    pq.write_table(table.slice(0,1),release/'meta/features.parquet')
+    build_training_index(release)
+    with pytest.raises(ValueError,match='No valid video'):
+        ReleaseDataset([release],tasks=['video'])
 
 
 def test_split_song_and_actor_audit(release):
@@ -174,11 +160,9 @@ def test_valid_nan_and_invalid_nan(model,batch):
         model.encode_conditions(altered)
 
 
-def test_precomputed_encoder_features_stay_frozen(model,batch):
-    batch['text_features']=batch['text_features'].clone().requires_grad_()
+def test_precomputed_audio_features_stay_frozen(model,batch):
     batch['audio_features']=batch['audio_features'].clone().requires_grad_()
     model.compute_loss(batch).backward()
-    assert batch['text_features'].grad is None
     assert batch['audio_features'].grad is None
     assert model.audio_adapter[-1].weight.grad.abs().sum()>0
 
@@ -229,18 +213,24 @@ def test_zero_weights_exact_fm_and_frame_times(model,batch):
     torch.testing.assert_close(loss,expected,atol=0,rtol=0)
 
 
-def test_task_sampler_resume_and_weighting():
-    ranges = {'text':[(0,3),(8,10)],'audio':[(3,8)]}
-    args = dict(size=10,batch_size=8,stop=1000,seed=17,task_ranges=ranges,task_weights={'text':.7,'audio':.3})
-    whole = list(StepBatchSampler(start=0,**args))
-    resumed = list(StepBatchSampler(start=43,**args))
-    assert whole[43:]==resumed
-    text = 0
-    for batch in whole:
-        tasks = {'audio' if 3<=i<8 else 'text' for i in batch}
-        assert len(tasks)==1
-        text += 'text' in tasks
-    assert .65<text/len(whole)<.75
+@pytest.mark.parametrize('size,batch_size',[(1,8),(10,3),(65543,257)])
+def test_epoch_sampler_coverage_and_resume(size,batch_size):
+    steps=(size+batch_size-1)//batch_size
+    args=dict(size=size,batch_size=batch_size,stop=steps*2,seed=17)
+    whole=list(EpochBatchSampler(start=0,**args))
+    for epoch in range(2):
+        indices=[i for batch in whole[epoch*steps:(epoch+1)*steps] for i in batch]
+        assert len(indices)==size and sorted(indices)==list(range(size))
+    offset=max(1,steps//2)
+    assert whole[offset:]==list(EpochBatchSampler(start=offset,**args))
+    if size>2:
+        assert whole[:steps]!=whole[steps:]
+
+
+def test_epoch_sampler_validation_ranges():
+    sampler=EpochBatchSampler(100,3,0,2,17,ranges=[(3,5),(8,11)])
+    indices=[i for batch in sampler for i in batch]
+    assert sorted(indices)==[3,4,8,9,10]
 
 
 def test_sampling_encodes_once_with_cfg(model,batch,monkeypatch):
@@ -258,7 +248,7 @@ def test_sampling_encodes_once_with_cfg(model,batch,monkeypatch):
 
 
 def test_nested_configuration():
-    cfg = load_config('configs/trimodal_release.yaml',['model.condition.text.enabled=false','data.task_weights.text=0.0','model.losses.joint_velocity=0.0'])
+    cfg = load_config('configs/trimodal_release.yaml',['model.condition.text.enabled=false','data.tasks=[audio]','model.losses.joint_velocity=0.0'])
     assert cfg.model.condition['text']['enabled'] is False
     assert cfg.model.losses['joint_velocity']==0
 
@@ -266,7 +256,7 @@ def test_nested_configuration():
 def test_real_release_resume_with_workers(release,cfg,tmp_path):
     cfg.data.backend='msc_release'
     cfg.data.roots=[str(release)]
-    cfg.data.task_weights={'audio':1.}
+    cfg.data.tasks=['audio']
     cfg.data.num_workers=2
     cfg.model.use_text=False
     cfg.model.losses={'joint_velocity':0.,'joint_acceleration':0.}
@@ -314,22 +304,88 @@ def test_cache_budget_and_short_subset(release):
         cache.get(k,lambda:(np.ones(4,dtype=np.float32),))
         assert cache.size<=32
     assert len(cache.items)==2
-    data=ReleaseDataset([release],task_weights={'audio':1},max_motions_per_task=1,max_windows_per_motion=3)
+    data=ReleaseDataset([release],tasks=['audio'],max_motions_per_task=1,max_windows_per_motion=3)
     assert len(data)==3
     assert len({data[i]['window_id'] for i in range(3)})==3
     assert len({data.window_identity(i)[1].motion_id for i in range(3)})==1
 
 
+def test_training_start_reads_only_prebuilt_index(release, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Training startup must not read Inventory or Parquet metadata')
+    monkeypatch.setattr(Inventory, 'read', forbidden)
+    monkeypatch.setattr(pq, 'read_table', forbidden)
+    data = ReleaseDataset([release], tasks=['text', 'audio'],
+                          max_motions_per_task=1, max_windows_per_motion=2)
+    assert len(data) == 4
+    assert data[data.task_ranges['text'][0][0]]['text'].strip()
+
+
+def test_training_index_publication_detects_stale_and_corrupt_files(release):
+    from data_pipeline.release.training_index import validate_training_index
+    summary = validate_training_index(release)
+    provenance = release / 'meta/provenance.json'
+    data = json.loads(provenance.read_text())
+    data['test_revision'] = 'changed'
+    provenance.write_text(json.dumps(data))
+    rebuilt = validate_training_index(release)
+    assert rebuilt['identity'] != summary['identity']
+    path = release / 'training' / rebuilt['splits']['train']['allow_estimated']['file']
+    with path.open('ab') as stream:
+        stream.write(b'corrupt')
+    with pytest.raises(ValueError, match='index checksum'):
+        validate_training_index(release)
+
+
+@pytest.mark.parametrize('scale,context', [(1., 0.), (1., .25), (2., .25)])
+def test_media_index_matches_individual_window_queries(scale, context):
+    from types import SimpleNamespace
+    from data_pipeline.release.training_index import _media_runs
+    from msc.data.temporal import covers
+    times = np.arange(1500, dtype=np.float64) / 75
+    # Include MERT block-boundary gaps and a genuinely irregular region.
+    times = np.delete(times, [374, 375, 800, 801, 802, 803])
+    times[1100:1110] += np.arange(10) * .00003
+    link = SimpleNamespace(time_scale=scale, time_offset_sec=.2, link_id='link',
+                           motion_valid_start_sec=.1, motion_valid_end_sec=5.)
+    feature = SimpleNamespace(token_time_semantics='point', token_rate_hz=75., feature_id='feature')
+    motion = dict(num_frames=150)
+    runs = _media_runs(motion, [(link, feature, times)], context)
+    indexed = {k for lo, hi, _ in runs for k in range(lo, hi)}
+    expected = set()
+    for k in range(5, 121):
+        start, end = k/30, (k+30)/30
+        if link.motion_valid_start_sec > start+1e-8 or link.motion_valid_end_sec < end-1e-8:
+            continue
+        _, local = select_tokens(times, link, start, end, context)
+        if covers(local, 0., 1., 'point', 75*scale):
+            expected.add(k)
+    assert indexed == expected
+
+
+def test_text_index_matches_annotation_coverage():
+    from data_pipeline.release.training_index import _text_runs
+    annotations = [dict(annotation_id='long', text='walk', start_sec=0., end_sec=5.),
+                   dict(annotation_id='short', text='turn', start_sec=.333333333, end_sec=2.2),
+                   dict(annotation_id='tail', text='stop', start_sec=2.4, end_sec=5.)]
+    runs = _text_runs(dict(num_frames=150), annotations)
+    for k in range(5, 121):
+        valid = [a for a in annotations if a['start_sec'] <= k/30+1e-8 and a['end_sec'] >= (k+30)/30-1e-8]
+        expected = min(valid, key=lambda a: (a['end_sec']-a['start_sec'], a['annotation_id']))['text']
+        actual = next(cond[0] for start,end,cond in runs if start <= k < end)
+        assert actual == expected
+
+
 def test_statistics_identity_and_zero_scales(release,cfg,tmp_path):
     from msc.data.stats import compute_stats
-    data=ReleaseDataset([release],task_weights={'audio':1},max_motions_per_task=1,max_windows_per_motion=2)
+    data=ReleaseDataset([release],tasks=['audio'],max_motions_per_task=1,max_windows_per_motion=2)
     stats=compute_stats(data)
     assert stats['split']=='train' and stats['dataset_identity']==data.identity
     assert min(stats['velocity_scale'])>=1e-4
     path=tmp_path/'stats.json'
     path.write_text(json.dumps(stats))
-    cfg.data.backend='msc_release';cfg.data.roots=[str(release)];cfg.data.task_weights={'audio':1.}
-    cfg.model.use_text=False;cfg.model.dynamic_stats_path=str(path)
+    cfg.data.backend='msc_release';cfg.data.roots=[str(release)];cfg.data.tasks=['audio']
+    cfg.model.use_text=False;cfg.model.losses=dict(joint_velocity=.05,joint_acceleration=.01);cfg.model.dynamic_stats_path=str(path)
     cfg.train.validation_every=0
     model=build_model(cfg,data.audio_metadata,data.feature_metadata)
     assert model.dynamic_stats_identity==data.identity
@@ -338,26 +394,25 @@ def test_statistics_identity_and_zero_scales(release,cfg,tmp_path):
         Trainer(model,data,cfg)
 
 
-def test_checkpoint_rejects_legacy_and_wrong_data(cfg,tmp_path):
+def test_checkpoint_rejects_legacy_and_wrong_data(cfg,toy_dataset,tmp_path):
     from msc.training.checkpoint import load_checkpoint
     path=tmp_path/'legacy.pt'
     torch.save(dict(version=1),path)
     with pytest.raises(ValueError,match='Unsupported'):
         load_checkpoint(path)
     cfg.train.steps=1;cfg.train.output_dir=str(tmp_path/'run')
-    data=build_dataset(cfg)
+    data=toy_dataset
     Trainer(build_model(cfg,data.audio_metadata,data.feature_metadata),data,cfg).fit()
     changed=copy.deepcopy(cfg)
     changed.train.resume=str(tmp_path/'run/last.pt')
-    changed.data.size+=1
-    other=build_dataset(changed)
+    other=ToyDataset(len(data)+1,changed.train.seed)
     with pytest.raises(ValueError,match='identity'):
         Trainer(build_model(changed,other.audio_metadata,other.feature_metadata),other,changed)
 
 
 def test_evaluation_measures_amplitude_and_rollout(release,cfg,tmp_path):
     from msc.evaluate import evaluate_dataset
-    data=ReleaseDataset([release],task_weights={'audio':1},max_motions_per_task=1)
+    data=ReleaseDataset([release],tasks=['audio'],max_motions_per_task=1)
     cfg.model.use_text=False
     model=build_model(cfg,data.audio_metadata,data.feature_metadata)
     # Evaluate index zero to guarantee two contiguous chunks exist.
@@ -375,9 +430,9 @@ def test_evaluation_measures_amplitude_and_rollout(release,cfg,tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
-def test_bf16_dynamics_finite(cfg,batch):
+def test_bf16_dynamics_finite(cfg,toy_dataset,batch):
     cfg.model.losses=dict(joint_velocity=.05,joint_acceleration=.01,dynamic_warmup_steps=0)
-    data=build_dataset(cfg)
+    data=toy_dataset
     model=build_model(cfg,data.audio_metadata,data.feature_metadata).to('cuda:1')
     batch={k:v.to('cuda:1') if isinstance(v,torch.Tensor) else v for k,v in batch.items()}
     with torch.autocast('cuda',dtype=torch.bfloat16):
@@ -406,7 +461,7 @@ def test_validation_does_not_change_training_rng(release,cfg,tmp_path):
     validation=tmp_path/'validation'
     export_release(inv,tracks,validation)
     cfg.data.backend='msc_release';cfg.data.roots=[str(release),str(validation)]
-    cfg.data.task_weights={'audio':1.};cfg.data.max_motions_per_task=1;cfg.data.max_windows_per_motion=2
+    cfg.data.tasks=['audio'];cfg.data.max_motions_per_task=1;cfg.data.max_windows_per_motion=2
     cfg.model.use_text=False;cfg.model.losses=dict(joint_velocity=0.,joint_acceleration=0.)
     cfg.train.validation_every=1;cfg.train.validation_batches=1;cfg.train.steps=2
     cfg.train.output_dir=str(tmp_path/'validated')
@@ -426,7 +481,7 @@ def test_origin_is_not_added_twice(release,monkeypatch):
     inv.motions=[replace(m,time_origin_sec=1/30) for m in inv.motions]
     with monkeypatch.context() as patch:
         patch.setattr(Inventory,'read',lambda *a,**kw:inv)
-        data=ReleaseDataset([release],task_weights={'audio':1.},max_motions_per_task=1)
+        data=ReleaseDataset([release],tasks=['audio'],max_motions_per_task=1)
         sample=data[0]
         ri,m,task,k,condition=data.window_identity(0)
         link=next(l for l in inv.links if l.link_id==condition[1])
@@ -437,10 +492,10 @@ def test_origin_is_not_added_twice(release,monkeypatch):
         torch.testing.assert_close(sample['audio_times'],torch.tensor(expected,dtype=torch.float32),atol=0,rtol=0)
 
 
-def test_checkpoint_rejects_previous_names_and_versions(cfg,tmp_path):
+def test_checkpoint_rejects_previous_names_and_versions(cfg,toy_dataset,tmp_path):
     from msc.training.checkpoint import load_checkpoint
     cfg.train.steps=1;cfg.train.output_dir=str(tmp_path/'native')
-    data=build_dataset(cfg)
+    data=toy_dataset
     Trainer(build_model(cfg,data.audio_metadata,data.feature_metadata),data,cfg).fit()
     path=tmp_path/'native/last.pt'
     saved=load_checkpoint(path)
@@ -455,3 +510,47 @@ def test_checkpoint_rejects_previous_names_and_versions(cfg,tmp_path):
     torch.save(saved,previous)
     with pytest.raises(ValueError,match='g1_canonical_125d'):
         load_checkpoint(previous)
+
+
+def test_release_raw_text_and_mixed_batch(release):
+    data=ReleaseDataset([release],tasks=['text', 'audio'],max_windows_per_motion=1)
+    text=data[data.task_ranges['text'][0][0]]
+    audio=data[data.task_ranges['audio'][0][0]]
+    assert text['text'].strip() and 'text_tokens' not in text
+    assert 'text' not in audio
+    batch=collate_motion([text,audio])
+    assert batch['text']==[text['text'],'']
+    assert batch['audio_mask'][1].any() and not batch['audio_mask'][0].any()
+
+
+@pytest.mark.integration
+def test_release_online_t5_training_and_sampling(release):
+    import os
+    path=os.environ.get('MSC_TEST_T5_PATH')
+    if not path:
+        pytest.skip('Set MSC_TEST_T5_PATH for real online T5')
+    data=ReleaseDataset([release],tasks=['text', 'audio'],max_windows_per_motion=1)
+    batch=collate_motion([data[data.task_ranges[t][0][0]] for t in ('text','audio')])
+    cfg=Config()
+    cfg.model.hidden_dim=64; cfg.model.num_layers=2; cfg.model.num_heads=4
+    cfg.data.roots=[str(release)]
+    cfg.model.t5_path=path
+    cfg.model.condition={'text':{'enabled':True,'dim':'auto','dropout':0.},
+                         'audio':{'enabled':True,'dropout':0.}}
+    model=build_model(cfg,data.audio_metadata,data.feature_metadata)
+    model.train()
+    calls=[]
+    hook=model.text_encoder.encoder.register_forward_pre_hook(lambda *args:calls.append(1))
+    memory=model.encode_conditions(batch)
+    assert not memory.mask[1][memory.modality_ids[1]==1].any()
+    calls.clear()
+    loss=model.compute_loss(batch)
+    loss.backward()
+    assert len(calls)==1
+    assert not model.text_encoder.encoder.training
+    assert all(not p.requires_grad and p.grad is None for p in model.text_encoder.parameters())
+    assert model.text_adapter[-1].weight.grad.abs().sum()>0
+    calls.clear()
+    generated=model.sample(batch['motion_history'],text=batch['text'],num_steps=2,cfg_scale=2.)
+    assert len(calls)==1 and generated.shape==(2,30,125) and generated.isfinite().all()
+    hook.remove()

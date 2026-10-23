@@ -9,13 +9,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from data_pipeline.schema.manifest import Inventory
 from data_pipeline.release.export import read_motion
 from data_pipeline.release.features import read_feature
-from data_pipeline.io import resolve_uri, sha256_file
 from msc.motion.codec import G1MotionFeatureCodec
 from msc.motion.kinematics import G1Kinematics
-from .temporal import select_tokens, covers
+from .temporal import select_tokens
 
 
 def fingerprint(value):
@@ -40,230 +38,129 @@ class ByteCache:
             self.items[key] = value
             self.size += size
         return value
+class IndexedSpans:
+    """Arrow rows stay columnar; only a requested motion becomes a Python object."""
+    def __init__(self, table):
+        self.table = table
 
+    def __len__(self):
+        return len(self.table)
 
-def audit_splits(inventories):
-    """Audit all splits/roots, including shared audio (not enforced by v1 schema)."""
-    seen = {}
-    def check(key, split):
-        previous = seen.setdefault(key, split)
-        if previous != split:
-            raise ValueError(f'Split leakage: {key}: {previous}/{split}')
-    for inv in inventories:
-        seq = {s.sequence_id: s for s in inv.sequences}
-        motions = {m.motion_id: m for m in inv.motions}
-        assets = {a.asset_id: a for a in inv.assets}
-        for s in inv.sequences:
-            check(('sequence', s.source_dataset, s.source_sequence_id), s.split)
-            check(('group', s.source_dataset, s.split_group_id), s.split)
-        for m in inv.motions:
-            s = seq[m.sequence_id]
-            check(('motion', s.source_dataset, m.motion_id), s.split)
-            if m.parent_motion_id:
-                parent = motions[m.parent_motion_id]
-                if parent.actor_id != m.actor_id or parent.sequence_id != m.sequence_id:
-                    raise ValueError('Parent motion Actor/Sequence mismatch')
-                if seq[parent.sequence_id].split != s.split:
-                    raise ValueError('Parent motion split leakage')
-        for link in inv.links:
-            m, a = motions[link.motion_id], assets[link.asset_id]
-            if link.actor_id is not None and link.actor_id != m.actor_id:
-                raise ValueError('Link Actor mismatch')
-            split = seq[m.sequence_id].split
-            check(('asset_checksum', a.modality, a.checksum), split)
-            check(('asset_source', a.modality, a.source_asset_id), split)
+    def __getitem__(self, index):
+        from data_pipeline.release.training_index import TrainingMotion, MOTION_COLUMNS
+        row = self.table.slice(int(index), 1).to_pylist()[0]
+        motion = TrainingMotion(**{key: row[key] for key in MOTION_COLUMNS})
+        condition = ('text', '', row['text']) if row['task'] == 'text' else (row['task'], row['link_id'], row['feature_id'])
+        return row['release_index'], motion, row['task'], row['start'], row['end'], condition
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
 
 
 class ReleaseDataset(Dataset):
     def __init__(self, roots, *, split='train', label_policy='train_default',
-                 alignment_policy='allow_estimated', task_weights=None, audio_context_sec=.25,
-                 video_context_sec=.25, text_cache_dir=None, cache_bytes=128 * 1024**2,
-                 limit_size=None, max_motions_per_task=None, max_windows_per_motion=None):
+                 alignment_policy='allow_estimated', tasks=None, audio_context_sec=.25,
+                 video_context_sec=.25, cache_bytes=128 * 1024**2,
+                 max_motions_per_task=None, max_windows_per_motion=None):
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        from data_pipeline.release.training_index import VERSION
+        from data_pipeline.schema.records import FeatureRecord, ModalityLink
+        self._settings = dict(roots=list(roots), split=split, label_policy=label_policy,
+            alignment_policy=alignment_policy, tasks=tasks, audio_context_sec=audio_context_sec,
+            video_context_sec=video_context_sec, cache_bytes=cache_bytes,
+            max_motions_per_task=max_motions_per_task, max_windows_per_motion=max_windows_per_motion)
         self.roots = [Path(p).resolve() for p in roots]
-        self.inventories = [Inventory.read(p) for p in self.roots]
-        if any(json.loads((p / 'dataset.json').read_text())['kind'] != 'release' for p in self.roots):
-            raise ValueError('Training requires a published Release')
-        audit_splits(self.inventories)
-        self.cache_bytes, self.cache = cache_bytes, None
-        self.codec = None
-        self.text_cache_dir = Path(text_cache_dir) if text_cache_dir else None
-        self.text_manifest = (json.loads((self.text_cache_dir / 'manifest.json').read_text())
-                              if self.text_cache_dir else None)
-        self.task_weights = {k: v for k, v in (task_weights or {'text': .5, 'audio': .5}).items() if v > 0}
-        self.spans, self.ends, self.task_ranges = [], [], {k: [] for k in self.task_weights}
-        self.report = {'short_motions': 0, 'windows': {}, 'excluded_conditions': 0}
-        feature_identity, releases = [], []
-        index_cache = ByteCache(cache_bytes)
-        total = 0
-        indexed_motions = {}
-        chosen_identities = set()
-        for ri, (root, inv) in enumerate(zip(self.roots, self.inventories)):
-            metadata_hashes = {str(p.relative_to(root)): sha256_file(p) for p in
-                              [root / 'dataset.json', root / 'meta/provenance.json', *sorted((root / 'meta').glob('*.parquet'))]}
-            # Detect payload replacement without scanning/decompressing whole motion shards.
-            uris = sorted({m.storage_uri for m in inv.motions} |
-                          {uri for f in inv.features for uri in (f.feature_uri,f.timestamp_uri)})
-            storage = {}
-            for uri in uris:
-                stat = resolve_uri(root,uri,inv.external_roots).stat()
-                storage[uri] = (stat.st_size,stat.st_mtime_ns)
-            releases.append(dict(metadata=metadata_hashes,storage_signatures=storage))
-            label = inv.provenance.get('train_default') if label_policy == 'train_default' else label_policy
-            if not label:
-                raise ValueError('Missing train_default in meta/provenance.json; choose an explicit label')
-            seq = {s.sequence_id: s for s in inv.sequences}
-            motion_map = {m.motion_id: m for m in inv.motions}
-            groups = {}
-            for m in inv.motions:
-                ancestor = m
-                visited = set()
-                while ancestor.parent_motion_id:
-                    if ancestor.motion_id in visited:
-                        raise ValueError('Motion parent cycle')
-                    visited.add(ancestor.motion_id)
-                    ancestor = motion_map[ancestor.parent_motion_id]
-                groups.setdefault((m.sequence_id, m.actor_id, ancestor.motion_id), []).append(m)
-            features = {}
-            for f in inv.features:
-                features.setdefault(f.asset_id, []).append(f)
-            links, annotations = {}, {}
-            for link in inv.links:
-                links.setdefault(link.motion_id, []).append(link)
-            for annotation in inv.annotations:
-                if annotation.motion_id is None:
-                    raise ValueError('Sequence-only text has ambiguous Actor/time origin; publish motion-specific annotations')
-                annotations.setdefault(annotation.motion_id, []).append(annotation)
-            for _,group in sorted(groups.items()):
-                chosen = [m for m in group if m.label_type == label]
-                if len(chosen) != 1:
-                    raise ValueError(f'Expected one {label} per source Motion/Actor, found {len(chosen)}')
-                m = chosen[0]
-                source = seq[m.sequence_id]
-                key = (source.source_dataset,source.source_sequence_id,m.actor_id,group[0].parent_motion_id or group[0].motion_id)
-                if key in chosen_identities:
-                    raise ValueError(f'Duplicate source Motion/Actor across Release roots: {key}')
-                chosen_identities.add(key)
-                if seq[m.sequence_id].split != split:
+        self.tasks = tasks if tasks is not None else ['text','audio']
+        self.contexts = dict(audio=audio_context_sec, video=video_context_sec)
+        self.cache_bytes, self.cache, self.codec = cache_bytes, None, None
+        self._lookup, self.external_roots = [], []
+        tables, identities, features = [], [], []
+        for ri, root in enumerate(self.roots):
+            path = root / 'training/summary.json'
+            if not path.exists():
+                raise FileNotFoundError(f'Missing training index: {path}. Run msc-data index --dataset {root}')
+            summary = json.loads(path.read_text())
+            if summary['version'] != VERSION or summary['contexts'] != self.contexts:
+                raise ValueError('Training index version/context changed; rebuild with msc-data index')
+            if label_policy != 'train_default' and label_policy != summary['label']:
+                raise ValueError('Training label differs from published index; rebuild with --label-policy')
+            entry = summary['splits'][split][alignment_policy]
+            table = pa.ipc.open_file(pa.memory_map(str(root / 'training' / entry['file']), 'r')).read_all()
+            table = table.filter(pc.is_in(table['task'], value_set=pa.array(self.tasks)))
+            table = table.append_column('release_index', pa.array(np.full(len(table), ri, dtype=np.int32)))
+            tables.append(table)
+            identities.append((summary['identity'], entry['sha256']))
+            self.external_roots.append(summary['external_roots'])
+            self._lookup.append(({x['link_id']: ModalityLink(**x) for x in summary['links']},
+                                 {x['feature_id']: FeatureRecord(**x) for x in summary['features']}))
+            modalities = {x['asset_id']: x['modality'] for x in summary['links']}
+            features.extend((modalities[f['asset_id']], f['encoder_name'], f['encoder_checkpoint_hash'],
+                             f['preprocess_hash'], tuple(f['shape'][1:]))
+                            for f in summary['features'] if f['asset_id'] in modalities
+                            and modalities[f['asset_id']] in self.tasks)
+        table = pa.concat_tables(tables)
+        # Subsets select rows before constructing any Python Motion objects.
+        if max_motions_per_task is not None:
+            masks = []
+            for task in self.tasks:
+                task_rows = pc.equal(table['task'], task)
+                ids = pc.cast(pc.unique(table.filter(task_rows)['motion_id']).slice(0, max_motions_per_task), pa.string())
+                masks.append(pc.and_(task_rows, pc.is_in(table['motion_id'], value_set=ids)))
+            keep = masks[0]
+            for mask in masks[1:]:
+                keep = pc.or_(keep, mask)
+            table = table.filter(keep)
+        self.rollout_spans = IndexedSpans(table)
+        if max_windows_per_motion is not None:
+            # Group once per motion/task, sample across all its condition spans.
+            keys = pc.binary_join_element_wise(pc.cast(table['release_index'], pa.string()),
+                    pc.cast(table['motion_id'], pa.string()), pc.cast(table['task'], pa.string()), ':')
+            codes = pc.dictionary_encode(keys).combine_chunks().indices.to_numpy()
+            selected, starts, ends = [], [], []
+            boundaries = np.r_[0, np.flatnonzero(codes[1:] != codes[:-1])+1, len(table)]
+            lo_values = table['start'].to_numpy()
+            hi_values = table['end'].to_numpy()
+            for lo, hi in zip(boundaries, boundaries[1:]):
+                if hi == lo:
                     continue
-                if m.num_frames < 35:
-                    self.report['short_motions'] += 1
-                    continue
-                for task in self.task_weights:
-                    if max_motions_per_task is not None and indexed_motions.get(task,0)>=max_motions_per_task:
-                        continue
-                    before = total
-                    candidates = sorted(annotations.get(m.motion_id, []), key=lambda a: a.annotation_id) if task == 'text' else []
-                    if task != 'text':
-                        for link in sorted(links.get(m.motion_id, []), key=lambda x: x.link_id):
-                            if link.modality != task or link.alignment_status == 'unknown':
-                                continue
-                            if alignment_policy == 'verified_only' and link.alignment_status != 'verified':
-                                continue
-                            fs = features.get(link.asset_id, [])
-                            if len(fs) > 1:
-                                raise ValueError('Multiple feature encoders for asset; provide an unambiguous Release')
-                            if fs:
-                                f = fs[0]
-                                values, times = index_cache.get((ri,f.feature_id),lambda: read_feature(root, f, inv.external_roots))
-                                if list(values.shape) != f.shape or str(values.dtype) != f.dtype or len(times) != len(values):
-                                    raise ValueError('Feature payload shape/dtype/timestamps differ from metadata')
-                                if task == 'audio' and (values.ndim != 2 or values.shape[1] != 768 or 'mert' not in f.encoder_name.lower()):
-                                    raise ValueError('Audio task requires frozen MERT [T,768]')
-                                if task == 'video' and (values.ndim != 3 or f.token_time_semantics != 'interval'):
-                                    raise ValueError('Video requires verified [T,K,D] interval features')
-                                from data_pipeline.schema.time_map import TimeMap
-                                TimeMap(link.time_scale,link.time_offset_sec).select(times,0.,1.,semantics=f.token_time_semantics)
-                                feature_identity.append((task, f.encoder_name, f.encoder_checkpoint_hash, f.preprocess_hash, f.shape[1:]))
-                                candidates.append((link, f, times))
-                    # Compact contiguous runs with the same chosen condition, not one Python object per window.
-                    run_start, previous = None, None
-                    for k in range(5, m.num_frames - 29):
-                        start, end = k / 30, (k + 30) / 30
-                        selected = None
-                        if task == 'motion_only':
-                            selected = ('motion_only',)
-                        elif task == 'text':
-                            valid = [a for a in candidates if a.text.strip() and a.start_sec <= start + 1e-8 and a.end_sec >= end - 1e-8]
-                            if valid:
-                                a = min(valid, key=lambda a: (a.end_sec-a.start_sec, a.annotation_id))
-                                if self.text_manifest is None or fingerprint(a.text) not in self.text_manifest['entries']:
-                                    raise ValueError('Missing T5 cache for a valid text window; run msc.cache_text --release-root')
-                                selected = ('text', a.annotation_id, a.text)
-                        else:
-                            for link, f, times in candidates:
-                                if link.motion_valid_start_sec > start + 1e-8 or link.motion_valid_end_sec < end - 1e-8:
-                                    continue
-                                # Include boundary support tokens, not just centres inside [start,end).
-                                context = audio_context_sec if task == 'audio' else video_context_sec
-                                _, local = select_tokens(times, link, start, end, context, f.token_time_semantics)
-                                if covers(local, 0., 1., f.token_time_semantics, f.token_rate_hz * link.time_scale if f.token_rate_hz else None):
-                                    selected = (task, link.link_id, f.feature_id)
-                                    break
-                        if selected != previous:
-                            if previous is not None:
-                                total = self._add_span(total, ri, m, task, run_start, k, previous)
-                            run_start, previous = k, selected
-                        if selected is None:
-                            self.report['excluded_conditions'] += 1
-                    if previous is not None:
-                        total = self._add_span(total, ri, m, task, run_start, m.num_frames-29, previous)
-                    if total > before:
-                        indexed_motions[task] = indexed_motions.get(task,0)+1
-        self.rollout_spans = self.spans.copy()
-        if max_motions_per_task is not None or max_windows_per_motion is not None:
-            grouped = {}
-            for span in self.spans:
-                ri,m,task,start,end,cond = span
-                grouped.setdefault((task,ri,m.motion_id),[]).append(span)
-            self.spans,self.ends = [],[]
-            self.task_ranges = {k:[] for k in self.task_weights}
-            counts,total = {},0
-            for (task,ri,mid),spans in sorted(grouped.items()):
-                if max_motions_per_task is not None and counts.get(task,0)>=max_motions_per_task:
-                    continue
-                counts[task] = counts.get(task,0)+1
-                if max_windows_per_motion is None:
-                    for ri,m,task,start,end,cond in spans:
-                        total = self._add_span(total,ri,m,task,start,end,cond)
-                else:
-                    cumulative = np.cumsum([s[4]-s[3] for s in spans])
-                    positions = np.unique(np.linspace(0,cumulative[-1]-1,min(max_windows_per_motion,cumulative[-1]),dtype=np.int64))
-                    for pos in positions:
-                        si = bisect_right(cumulative,pos)
-                        ri,m,task,start,end,cond = spans[si]
-                        k = int(start+pos-(cumulative[si-1] if si else 0))
-                        total = self._add_span(total,ri,m,task,k,k+1,cond)
-        for task, ranges in self.task_ranges.items():
-            self.report['windows'][task] = sum(end-start for start, end in ranges)
-            if not ranges:
-                raise ValueError(f'No valid {task} windows: missing features/coverage or split; task is Pending')
-        if limit_size is not None:
-            raise ValueError('Release limit_size is ambiguous across tasks; use explicit Release subsets')
-        self.audio_metadata = {'backend': 'msc_release', 'features': sorted(set(tuple(x[:4]) for x in feature_identity if x[0] == 'audio'))}
-        self.feature_metadata = {'features': sorted(set((x[0], x[1], x[2], x[3], tuple(x[4])) for x in feature_identity)),
-                                 'video_task': 'offline_demonstration',
-                                 'text': self.text_manifest and self.text_manifest['encoder']}
-        self.identity = fingerprint(dict(window_contract='msc_release_35f_link_clipped_context_v1',
-                                         releases=releases, split=split, label_policy=label_policy,
-                                         alignment=alignment_policy, weights=self.task_weights,
-                                         text=self.text_manifest, index=[(r, m.motion_id,t,a,b,c) for r,m,t,a,b,c in self.spans],
-                                         contexts=[audio_context_sec,video_context_sec]))
-        self.contexts = {'audio': audio_context_sec, 'video': video_context_sec}
-        self._lookup = None
-
-    def _add_span(self, total, ri, motion, task, start, end, condition):
-        self.spans.append((ri, motion, task, start, end, condition))
-        self.ends.append(total + end - start)
-        self.task_ranges[task].append((total, total + end-start))
-        return total + end-start
+                counts = np.cumsum(hi_values[lo:hi]-lo_values[lo:hi])
+                positions = np.unique(np.linspace(0, counts[-1]-1, min(max_windows_per_motion, counts[-1]), dtype=np.int64))
+                rows = np.searchsorted(counts, positions, side='right')
+                frames = lo_values[lo+rows] + positions - np.r_[0, counts][rows]
+                selected.extend((lo+rows).tolist())
+                starts.extend(frames.tolist())
+                ends.extend((frames+1).tolist())
+            table = table.take(pa.array(selected, type=pa.int64()))
+            table = table.set_column(table.schema.get_field_index('start'), 'start', pa.array(starts, type=pa.int64()))
+            table = table.set_column(table.schema.get_field_index('end'), 'end', pa.array(ends, type=pa.int64()))
+        self.spans = IndexedSpans(table)
+        self.ends = np.cumsum(table['end'].to_numpy()-table['start'].to_numpy())
+        beginnings = np.r_[0, self.ends[:-1]]
+        self.task_ranges = {}
+        for task in self.tasks:
+            rows = np.flatnonzero(pc.equal(table['task'], task).to_numpy())
+            if not len(rows):
+                raise ValueError(f'No valid {task} windows in {split}')
+            self.task_ranges[task] = list(zip(beginnings[rows].tolist(), self.ends[rows].tolist()))
+        self.report = dict(windows={t: sum(b-a for a,b in ranges) for t,ranges in self.task_ranges.items()})
+        features = sorted(set(features))
+        self.audio_metadata = dict(backend='msc_release', features=[f[:4] for f in features if f[0]=='audio'])
+        self.feature_metadata = dict(features=features, video_task='offline_demonstration')
+        self.identity = fingerprint(dict(index_version=VERSION, releases=identities, split=split,
+            tasks=self.tasks, alignment=alignment_policy, label=label_policy,
+            max_motions_per_task=max_motions_per_task, max_windows_per_motion=max_windows_per_motion))
 
     def __len__(self):
-        return self.ends[-1] if self.ends else 0
+        return int(self.ends[-1]) if len(self.ends) else 0
 
     def __getstate__(self):
-        state = dict(self.__dict__)
-        state.update(cache=None,codec=None,_lookup=None)
-        return state
+        # Spawn workers reopen the shared files instead of pickling the Arrow tables.
+        return self._settings
+
+    def __setstate__(self, settings):
+        self.__init__(**settings)
 
     def window_identity(self, index):
         si = bisect_right(self.ends, index)
@@ -279,20 +176,25 @@ class ReleaseDataset(Dataset):
 
     def read_window(self,release_index,motion_id,task,k):
         """Explicit deterministic evaluation query, independent of sparse train subsets."""
-        for ri,m,t,start,end,condition in self.rollout_spans:
-            if (ri,m.motion_id,t)==(release_index,motion_id,task) and start<=k<end:
+        for ri,m,t,start,end,condition in self.motion_spans(release_index,motion_id,task):
+            if start<=k<end:
                 return self._read_window(ri,m,t,k,condition)
         return None
 
+    def motion_spans(self, release_index, motion_id, task):
+        import pyarrow.compute as pc
+        table = self.rollout_spans.table
+        mask = pc.and_(pc.equal(table['release_index'], release_index),
+                       pc.and_(pc.equal(table['motion_id'], motion_id), pc.equal(table['task'], task)))
+        return IndexedSpans(table.filter(mask))
+
     def _read_window(self,ri,m,task,k,condition):
-        root, inv = self.roots[ri], self.inventories[ri]
+        root = self.roots[ri]
         if self.cache is None:
             self.cache = ByteCache(self.cache_bytes)
             self.codec = G1MotionFeatureCodec(G1Kinematics(), num_prev_states=5, canonical_frame_idx=4, rotation_representation='rot6d')
         window = replace(m, row_start=m.row_start+k-5, num_frames=35)
         qpos, times = self.cache.get(('motion',ri,m.motion_id,k), lambda: read_motion(root, window))
-        if len(qpos) != 35 or not np.allclose(times, np.arange(k-5,k+30)/30, atol=1e-7,rtol=0):
-            raise ValueError('Invalid motion-local window timestamps')
         qpos = torch.from_numpy(qpos.copy())[None]
         fk = self.codec.kinematics.forward_kinematics(qpos)
         history, anchor_pos, anchor_quat = self.codec.prev_state_features_from_history(qpos[:,:5], fk['body_pos_w'][:,:5], None, 30.)
@@ -302,20 +204,11 @@ class ReleaseDataset(Dataset):
                       window_id=f'{ri}:{m.motion_id}:{m.actor_id}:{m.label_type}:{k}',
                       anchor_qpos=qpos[0,4].clone())
         if task == 'text':
-            entry = self.text_manifest['entries'][fingerprint(condition[2])]
-            path = resolve_uri(self.text_cache_dir,entry)
-            if sha256_file(path) != self.text_manifest['checksums'][entry]:
-                raise ValueError('Text cache checksum mismatch')
-            obj = torch.load(path,map_location='cpu',weights_only=True)
-            if obj['encoder'] != self.text_manifest['encoder'] or obj['text'] != condition[2]:
-                raise ValueError('Text cache identity mismatch')
-            sample.update(text_tokens=obj['features'], text_mask=obj['mask'])
+            sample['text'] = condition[2]
         elif task in ('audio','video'):
-            if self._lookup is None:
-                self._lookup = [({x.link_id:x for x in inventory.links},{x.feature_id:x for x in inventory.features}) for inventory in self.inventories]
             link = self._lookup[ri][0][condition[1]]
             feature = self._lookup[ri][1][condition[2]]
-            values, times = self.cache.get(('feature',ri,feature.feature_id), lambda: read_feature(root,feature,inv.external_roots))
+            values, times = self.cache.get(('feature',ri,feature.feature_id), lambda: read_feature(root,feature,self.external_roots[ri]))
             selected, local = select_tokens(times,link,k/30,(k+30)/30,self.contexts[task],feature.token_time_semantics)
             tokens = torch.from_numpy(np.array(values[selected],dtype=np.float32))
             sample[task+'_tokens'] = tokens

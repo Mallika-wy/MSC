@@ -10,7 +10,7 @@ from msc.factory import build_dataset,build_model,seed_everything,to_device
 from msc.data.stats import compute_stats
 from msc.data.collator import collate_motion
 from msc.training.trainer import Trainer
-from msc.training.trainer import StepBatchSampler
+from msc.training.trainer import EpochBatchSampler
 from msc.evaluate import evaluate_dataset
 
 
@@ -43,8 +43,8 @@ def initial_identity(model,dataset,cfg):
         parameters.update(name.encode())
         parameters.update(tensor.detach().cpu().contiguous().numpy().tobytes())
     sampling=hashlib.sha256()
-    sampler=StepBatchSampler(len(dataset),cfg.train.batch_size,0,
-        cfg.train.steps*cfg.train.accumulation_steps,cfg.train.seed,dataset.task_ranges,cfg.data.task_weights)
+    sampler=EpochBatchSampler(len(dataset),cfg.train.batch_size,0,
+        cfg.train.steps*cfg.train.accumulation_steps,cfg.train.seed)
     for batch in sampler:
         sampling.update(json.dumps(batch).encode())
     return dict(initial_state_sha256=parameters.hexdigest(),sampler_sequence_sha256=sampling.hexdigest(),
@@ -72,11 +72,9 @@ def run(cfg,output,sonic_config=None):
     cfg.train.resume=None
     cfg.train.log_every=10
     cfg.model.losses['dynamic_warmup_steps']=100
-    for task,weight in cfg.data.task_weights.items():
-        if weight<=0:
-            continue
+    for task in cfg.data.tasks:
         task_cfg=copy.deepcopy(cfg)
-        task_cfg.data.task_weights={task:1.}
+        task_cfg.data.tasks=[task]
         task_cfg.train.steps=200
         task_cfg.train.schedule_steps=1000
         task_cfg.train.warmup_steps=0

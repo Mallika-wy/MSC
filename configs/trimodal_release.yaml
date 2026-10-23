@@ -3,8 +3,7 @@ model:
   num_layers: 6
   num_heads: 8
   ffn_dim: 2048
-  text_backend: precomputed
-  text_cache_dir: null # Set after running msc.cache_text.
+  t5_path: model/t5-base-local
   condition:
     fusion: token_cross_attention
     temporal_bias: relative_distance
@@ -22,14 +21,18 @@ model:
   rtc: false
 data:
   backend: msc_release
-  roots: [/path/to/text/release, data/processed/audio/aistpp/release]
+  roots:
+    - data/processed/omg-text/release
+    - data/processed/audio/aistpp/release
+    - data/processed/audio/finedance/release
+    - data/processed/audio/gdance/release
   split: train
   label_policy: train_default
   alignment_policy: allow_estimated
   audio_context_sec: 0.25
   video_context_sec: 0.25
   cache_bytes: 134217728
-  task_weights: {text: 0.5, audio: 0.5, video: 0.0}
+  tasks: [text, audio]
   num_workers: 4
 train:
   device: cuda:0

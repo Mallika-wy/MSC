@@ -1,5 +1,7 @@
 # MSC 数据处理与共享分片发布
 
+最终数据包的目录、全部表字段、动作/音频/视频内容及读取示例见 [Release 通用数据格式说明](Release数据格式说明.md)。
+
 主流程为 `SourceSequence → Independent Processors → Artifacts / Alignment → ReleaseBuilder`。
 支持 AIST++、FineDance、AIOZ-GDance 和本机清洗后的 OMG Motion+Text。
 本轮只负责预处理和发布；`src/msc/data/` 的统一训练加载器尚未接入此 Release。
@@ -133,6 +135,7 @@ CUDA_VISIBLE_DEVICES=4 .venv/bin/python -m data_pipeline.cli run \
 ```
 
 `--root` 指定原始数据目录。`--finalize` 在发布后把特征写入 release，逐条验证动作和特征，再清除输出目录中的 work、cache 和运行日志；最终只保留 release、config.json 和 summary.json。未完成打包时保留处理缓存以便恢复。原始数据和模型文件不受清理影响。
+动作全量校验按 Parquet 分片默认使用 8 个进程，每个所需数据块只读取一次；小样本不启动进程池。元数据关联检查与原有数值、时间戳、四元数规则保持不变。独立校验可用 `validate --workers 8` 调整并行数；打包中断后可继续验证已完整生成的 bundle。
 
 在 MSC 根目录使用 `.venv/bin/python`。GMR 源码和 G1 资产位于 `third_party/gmr`；SONIC 官方部署源码、配置和 G1 仿真模型位于 `third_party/sonic`，权重在 `model/sonic`。运行时不读取兄弟目录中的 GMR、SONIC 或 OMG 代码；源数据目录仍由配置指定。执行控制为 50 Hz，发布动作保持 30 Hz，首个执行标签对应源时间 `1/30` 秒。
 
@@ -206,3 +209,43 @@ alignment_status, alignment_source`，可选 `camera_id, track_id`。
 .venv/bin/python -m pytest data_pipeline/tests -q
 .venv/bin/python -m pytest tests -q -m 'not integration and not slow'
 ```
+
+## 训练时在线编码文本
+
+Release 只保存 `meta/annotations.parquet` 中的原始文本，不预计算或打包 T5 token。训练加载器按窗口选择描述，返回 `text` 字符串；Collator 将其组成 batch，并为空缺文本的音频样本保留空字符串。模型使用本地冻结 T5 按 batch 编码，空描述对应的文本 mask 全为 false。
+
+```yaml
+model:
+  t5_path: model/t5-base-local
+```
+
+T5 处于 eval、无梯度模式，文本编码结果只供当前训练前向使用；生成时在 Flow 迭代前编码一次，各步复用同一条件 memory。模型输出维度从本地 T5 配置读取，不生成逐文本磁盘缓存。
+
+## 音频包的 8:1:1 划分
+
+AIST++、FineDance 的配置默认使用 `song_disjoint`、`split_ratios: [0.8, 0.1, 0.1]`、`split_seed: 0`。按共享音频内容及来源分组的连通分量整体分配；AIST++ 额外按原始音乐编号（如 mBR0）关联不同裁剪的同曲片段，数量比例按通过筛选后的序列计，不是按动作版本或窗口计。先将目标数量取整；分组允许时精确分配，无法整除时保留整组，优先避免音频跨 split。
+
+已有包可重分，不重新仿真或提取特征：
+
+```bash
+.venv/bin/python -m data_pipeline.cli resplit \
+  --dataset data/processed/audio/aistpp/release --ratios 0.8 0.1 0.1
+```
+
+重写动作分片和 split 元数据，特征文件复用原始字节；新包校验成功后替换旧包。当前 AIST++ 为 842/105/105，FineDance 为 75/9/9（train/val/test）。
+
+## 与本地 OMG 训练缓存的区别
+
+本地 OMG 的 `src/omg/data/datamodule.py` 当前 materialized 训练路径使用 ConcatDataset 和分片局部打乱，没有固定 text/audio 的 50:50 配比；最终条件出现频率由有效窗口及样本具备的模态决定。其 `EpisodeCachedG1MotionDataset` 读取预先保存的 `qpos_36.npy`、`body_pos_w.npy`、`body_quat_w.npy`，通过 mmap 和分片/episode 缓存取窗口，再按窗口 anchor 做 canonicalization。
+
+MSC 当前离线保存 MERT 特征，T5 在训练时在线编码；训练读取动作时仍按窗口解压 Parquet 并计算 FK，仅有进程内有容量上限的缓存，尚无独立的持久化帧级 FK 训练缓存。因此两者不是同等程度的训练物化。正式训练提速可以另建按 shard 存储、可重建的帧级 qpos/FK mmap 缓存，不宜将大量重叠窗口的完整 125D 标签重复存盘。窗口的 canonical anchor 仍应在取样时统一计算。
+
+128 个真实 35 帧窗口的局部测量中，直接读取并计算 FK 用时约 4.82 秒，预先准备帧级 qpos/body position 后仅复制窗口约 0.0023 秒。这只比较暖文件缓存下的读取/FK阶段，未计条件读取、canonicalization、collation 或模型计算，不能解释成完整训练的加速倍数。
+
+## 训练数据遍历与缓存边界
+
+`train.sh` 使用本地冻结 T5 在线编码。四个 release 通过 `data.roots` 统一读取；`data.tasks: [text, audio]` 仅选择条件类型，不分配 task 权重。训练按有效窗口无放回遍历，每轮重新打乱块顺序及块内顺序，末尾不完整 batch 保留，支持断点精确继续；总更新数仍受 `train.steps` 限制。不同数据集/模态的出现频率由其有效窗口数量决定。每块最多 65,536 个索引，避免一次构建全量 OMG 的随机排列。
+
+数据保存职责如下：release 中保存动作 qpos、原始文本、MERT 音频特征及必要索引；本地模型放在 model/；训练输出与统计放在 .runs/。尚未实现的帧级 FK 加速缓存可作为独立可重建派生物，不能代替 release。没有视频特征时不启用视频任务。
+
+A6000 的局部对照：batch=8、历史5帧/未来30帧、动作模型6层/512维、BF16，T5 使用FP32、最多50 token。只测模型前向/反向/AdamW时，GPU 上已有文本 token 约61.3ms/步，在线T5约73.4ms/步，增加约12.1ms（19.7%）。未计入Dataset读取、FK、音频/视频编码，不能视为完整训练或所有模态在线编码的降速比例。

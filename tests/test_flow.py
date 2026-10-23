@@ -35,7 +35,6 @@ def test_loss_and_gradient(model, batch):
     loss.backward()
     assert torch.isfinite(loss)
     assert model.motion_generator.output.weight.grad.abs().sum() > 0
-    assert model.text_adapter[1].weight.grad.abs().sum() > 0
     assert model.motion_generator.layers[0].key.weight.grad.abs().sum() > 0
     assert model.audio_adapter[1].weight.grad.abs().sum() > 0
 

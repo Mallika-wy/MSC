@@ -55,7 +55,7 @@ class ConditionBridge(nn.Module):
         times, supports = [ht],[torch.stack((ht,ht),-1)]
         ids = [torch.zeros_like(ht,dtype=torch.long)]
         for mid,modality in enumerate(('text','audio','video'),1):
-            features = batch.get(modality+'_tokens',batch.get(modality+'_features'))
+            features = batch.get(modality+'_tokens') if modality == 'text' else batch.get(modality+'_tokens',batch.get(modality+'_features'))
             if features is None:
                 continue
             if modality not in self.adapters:

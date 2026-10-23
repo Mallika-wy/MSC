@@ -67,10 +67,12 @@ class MSCModel(nn.Module):
         if history.ndim != 3 or history.shape[1:] != (5,125) or not torch.isfinite(history).all():
             raise ValueError('history must be finite canonical [B,5,125]')
         batch = dict(batch)
-        if batch.get('text_tokens',batch.get('text_features')) is None and batch.get('text') is not None and any(s.strip() for s in batch['text']):
+        if batch.get('text_tokens') is None and batch.get('text') is not None and any(s.strip() for s in batch['text']):
             if self.text_encoder is None:
                 raise ValueError('Raw text requires local frozen T5')
             batch['text_tokens'],batch['text_mask'] = self.text_encoder(batch['text'],history.device)
+            has_text = torch.tensor([bool(text.strip()) for text in batch['text']],device=history.device)
+            batch['text_mask'] &= has_text[:,None]
         return self.condition_bridge(batch,self.representation.normalize(history))
 
     def conditions(self,batch,*,drop_modalities=False):
@@ -108,15 +110,11 @@ class MSCModel(nn.Module):
 
     @torch.no_grad()
     def sample(self, history, text=None, audio=None, *, audio_mask=None, audio_metadata=None,
-               text_features=None, text_mask=None, text_tokens=None, audio_tokens=None,
+               audio_tokens=None,
                audio_times=None, video_tokens=None,
                video_mask=None, video_intervals=None, num_steps=10, cfg_scale=1.0, initial_noise=None,
                previous_motion=None, rtc_mode="off", inference_delay=0, execution_horizon=None,
                rtc_mask_schedule="exponential", rtc_guidance_alpha=0.9):
-        if text_tokens is not None:
-            if text_features is not None:
-                raise ValueError('Supply only text_tokens or legacy text_features')
-            text_features = text_tokens
         if audio_tokens is not None:
             if audio is not None:
                 raise ValueError('Supply only audio_tokens or legacy audio')
@@ -137,8 +135,6 @@ class MSCModel(nn.Module):
                 if len(text) != len(history):
                     raise ValueError("One caption per history sample is required")
                 batch["text"] = text
-            if text_features is not None:
-                batch.update(text_features=text_features, text_mask=text_mask)
             if audio is not None:
                 batch.update(audio_tokens=audio, audio_mask=audio_mask, audio_times=audio_times)
             if video_tokens is not None:

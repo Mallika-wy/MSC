@@ -37,5 +37,7 @@ release:
   - tracker_executed
   train_default: tracker_executed
   max_shard_frames: 1000000
-  split_policy: preserve
+  split_policy: song_disjoint
+  split_ratios: [0.8, 0.1, 0.1]
+  split_seed: 0
   alignment_policy: allow_estimated

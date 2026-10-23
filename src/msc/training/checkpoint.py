@@ -23,12 +23,11 @@ def restore_rng(state):
 def metadata(model, config, dataset=None):
     return dict(representation=model.representation.metadata(), audio=model.audio_metadata,
                 text_model_sha256=model.text_encoder.fingerprint if model.text_encoder else None,
-                data=dict(backend=config.data.backend, split=config.data.split, size=config.data.size,
-                          limit_size=config.data.limit_size),
+                data=dict(backend=config.data.backend, split=config.data.split),
                 architecture=model.architecture_version,features=model.feature_metadata,
                 dataset_identity=getattr(dataset,'identity',None),
                 dynamic_stats_sha256=model.dynamic_stats_sha256,
-                sampling=dict(version=2,task_weights=config.data.task_weights,seed=config.train.seed),
+                sampling=dict(version=3,mode='epoch_shuffle',tasks=config.data.tasks,seed=config.train.seed,block_size=65536),
                 noise=dict(seed_offset=1000003,mode='per_microstep',rng='torch'),
                 losses=dict(version=1,config=model.loss_config),
                 flow=dict(type="linear_velocity", time_scale=1000.0, time_sampling="uniform", direction="1_to_0"))

@@ -6,7 +6,9 @@ def collate_motion(samples):
     batch = {}
     variable = {f'{m}_{field}' for m in ('text','audio','video')
                 for field in ('tokens','features','mask','times','intervals')}
-    for key in set.union(*(set(s) for s in samples)) - variable:
+    if any('text' in s for s in samples):
+        batch['text'] = [s.get('text','') for s in samples]
+    for key in set.union(*(set(s) for s in samples)) - variable - {'text'}:
         if all(key in s for s in samples):
             batch[key] = default_collate([s[key] for s in samples])
     for modality in ('text','audio','video'):

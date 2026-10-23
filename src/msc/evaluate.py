@@ -8,7 +8,7 @@ from msc.sample import load_model
 from msc.factory import build_dataset, to_device
 from msc.data.collator import collate_motion
 from msc.models.losses import joint_dynamics
-from msc.training.trainer import StepBatchSampler
+from msc.training.trainer import EpochBatchSampler
 from msc.motion.codec import G1MotionFeatureCodec
 from msc.motion.kinematics import G1Kinematics
 
@@ -43,15 +43,15 @@ def sample_batch(model,batch,noise):
 
 def task_indices(dataset,task,batches,batch_size):
     if getattr(dataset,'task_ranges',None):
-        return StepBatchSampler(len(dataset),batch_size,0,batches,1729,
-                                {task:dataset.task_ranges[task]},{task:1.})
-    return StepBatchSampler(len(dataset),batch_size,0,batches,1729)
+        return EpochBatchSampler(len(dataset),batch_size,0,batches,1729,
+                                ranges=dataset.task_ranges[task])
+    return EpochBatchSampler(len(dataset),batch_size,0,batches,1729)
 
 
 @torch.no_grad()
 def evaluate_dataset(model,dataset,*,batches=4,batch_size=4,device='cpu',output_dir=None,sonic_config=None,rollout_chunks=2):
     model.eval()
-    tasks = sorted(getattr(dataset,'task_ranges',{}) or {'synthetic':None})
+    tasks = sorted(getattr(dataset,'task_ranges',{}))
     results = {}
     codec = G1MotionFeatureCodec(G1Kinematics(),num_prev_states=5,canonical_frame_idx=4,rotation_representation='rot6d')
     generator = torch.Generator(device=device).manual_seed(1729)
@@ -113,8 +113,7 @@ def rollout(model,dataset,index,codec,chunks,device,output,sonic_config=None):
     ri,m,task,k,_ = dataset.window_identity(index)
     # Start at the first eligible window of the sampled motion so short subset
     # selection cannot accidentally truncate the continuity check at its tail.
-    k = min(start for sri,sm,st,start,_,_ in dataset.rollout_spans
-            if (sri,sm.motion_id,st)==(ri,m.motion_id,task))
+    k = min(start for _,_,_,start,_,_ in dataset.motion_spans(ri,m.motion_id,task))
     first = dataset.read_window(ri,m.motion_id,task,k)
     history = first['motion_history'][None].to(device)
     anchor = first['anchor_qpos'][None]
@@ -180,10 +179,7 @@ def main():
     if args.split != 'train' and cfg.train.validation_motions_per_task:
         cfg.data.max_motions_per_task=cfg.train.validation_motions_per_task
     if args.data_root:
-        if cfg.data.backend=='msc_release':
-            cfg.data.roots=args.data_root
-        else:
-            cfg.data.root=args.data_root[0]
+        cfg.data.roots=args.data_root
     dataset = build_dataset(cfg)
     if json.dumps(dataset.audio_metadata,sort_keys=True)!=json.dumps(model.audio_metadata,sort_keys=True):
         raise ValueError('Evaluation audio provenance differs from checkpoint')

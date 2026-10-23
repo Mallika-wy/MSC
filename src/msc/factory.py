@@ -3,7 +3,6 @@ import numpy as np
 import torch
 from msc.models.msc_model import MSCModel
 from msc.models.conditioning.text import T5TextEncoder
-from msc.data.synthetic import SyntheticDataset
 
 
 def seed_everything(seed):
@@ -15,16 +14,12 @@ def seed_everything(seed):
 
 
 def build_dataset(config):
-    if config.data.backend == "synthetic":
-        return SyntheticDataset(config.data.size, config.model.text_dim, seed=config.train.seed)
-    if config.data.backend == 'msc_release':
-        from msc.data.release_dataset import ReleaseDataset
-        from dataclasses import asdict
-        d = asdict(config.data)
-        for key in ('backend','root','size','num_workers'):
-            d.pop(key)
-        return ReleaseDataset(**d,text_cache_dir=config.model.text_cache_dir)
-    raise ValueError(f'Unsupported dataset backend: {config.data.backend}')
+    from msc.data.release_dataset import ReleaseDataset
+    from dataclasses import asdict
+    d = asdict(config.data)
+    for key in ('backend','num_workers'):
+        d.pop(key)
+    return ReleaseDataset(**d)
 
 
 def build_model(config, audio_metadata=None, feature_metadata=None):
@@ -36,23 +31,14 @@ def build_model(config, audio_metadata=None, feature_metadata=None):
     use_text, use_audio = text.get('enabled',m.use_text),audio.get('enabled',m.use_audio)
     encoder = None
     text_dim = text.get('dim',m.text_dim)
-    metadata = feature_metadata or {}
-    if config.data.backend == 'msc_release' and use_text:
-        if not metadata.get('text'):
-            # Audio-only release training should explicitly disable text.
-            raise ValueError('Enabled text requires an offline T5 cache manifest')
-        actual_dim = metadata['text']['output_dim']
-        if text_dim not in ('auto',actual_dim):
-            raise ValueError('Configured text dimension differs from T5 cache metadata')
-        text_dim = actual_dim
-    elif use_text and text.get('backend',m.text_backend) == 't5':
-        encoder = T5TextEncoder(m.t5_path,frozen=True,max_length=m.text_max_length,cache_dir=m.text_cache_dir)
+    if use_text:
+        encoder = T5TextEncoder(m.t5_path,frozen=True,max_length=m.text_max_length)
         text_dim = encoder.output_dim
     if use_text and text_dim == 'auto':
-        raise ValueError('text dim auto requires real T5/cache metadata')
+        raise ValueError('text dim auto requires local T5 metadata')
     video_dim, spatial = None,None
     if video.get('enabled',False):
-        identities = {tuple(x[-1]) for x in metadata.get('features',[]) if x[0]=='video'}
+        identities = {tuple(x[-1]) for x in (feature_metadata or {}).get('features',[]) if x[0]=='video'}
         if len(identities) != 1:
             raise ValueError('Enabled video requires one verified K/D feature layout')
         spatial,video_dim = next(iter(identities))

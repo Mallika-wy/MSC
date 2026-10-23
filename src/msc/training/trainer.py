@@ -13,36 +13,55 @@ from .checkpoint import save_checkpoint, load_checkpoint, metadata, restore_rng
 from bisect import bisect_right
 
 
-class StepBatchSampler(Sampler):
-    """Uniform windows with replacement, reproducible without a huge randperm.
+class EpochBatchSampler(Sampler):
+    """Visit each window once per epoch; bounded block shuffling supports exact resume."""
+    block_size = 65536
 
-    Each microbatch has its own RNG seed; resume skips no model RNG draws and
-    does not read earlier data. Official training windows themselves are fixed.
-    """
-    def __init__(self, size, batch_size, start, stop, seed, task_ranges=None, task_weights=None):
-        self.size, self.batch_size, self.start, self.stop, self.seed = size, batch_size, start, stop, seed
-        self.tasks = sorted(task_ranges or {})
-        self.ranges = task_ranges or {}
-        self.weights = torch.tensor([(task_weights or {})[k] for k in self.tasks],dtype=torch.float64)
-        self.ends = {k: torch.tensor([b-a for a,b in self.ranges[k]]).cumsum(0).tolist() for k in self.tasks}
+    def __init__(self, size, batch_size, start, stop, seed, ranges=None):
+        self.ranges = ranges
+        self.ends = []
+        for a,b in ranges or []:
+            self.ends.append((self.ends[-1] if self.ends else 0)+b-a)
+        self.size = self.ends[-1] if ranges else size
+        self.batch_size, self.start, self.stop, self.seed = batch_size,start,stop,seed
+        self.batches_per_epoch = math.ceil(self.size / batch_size)
 
     def __iter__(self):
-        for step in range(self.start, self.stop):
-            gen = torch.Generator().manual_seed(self.seed + step)
-            if not self.tasks:
-                yield torch.randint(self.size, (self.batch_size,), generator=gen).tolist()
-                continue
-            task = self.tasks[torch.multinomial(self.weights,1,generator=gen).item()]
-            ends = self.ends[task]
-            positions = torch.randint(ends[-1],(self.batch_size,),generator=gen).tolist()
-            indices = []
-            for pos in positions:
-                span = bisect_right(ends,pos)
-                indices.append(self.ranges[task][span][0]+pos-(ends[span-1] if span else 0))
-            yield indices
+        step = self.start
+        while step < self.stop:
+            epoch, batch_offset = divmod(step,self.batches_per_epoch)
+            skip = batch_offset*self.batch_size
+            blocks = math.ceil(self.size/self.block_size)
+            generator = torch.Generator().manual_seed(self.seed+epoch)
+            order = torch.randperm(blocks,generator=generator).tolist()
+            batch = []
+            for block in order:
+                first = block*self.block_size
+                length = min(self.block_size,self.size-first)
+                if skip >= length:
+                    skip -= length
+                    continue
+                generator = torch.Generator().manual_seed(self.seed+epoch*1000003+block*104729)
+                indices = torch.randperm(length,generator=generator).tolist()
+                for local in indices[skip:]:
+                    index = first+local
+                    if self.ranges:
+                        span = bisect_right(self.ends,index)
+                        index = self.ranges[span][0]+index-(self.ends[span-1] if span else 0)
+                    batch.append(index)
+                    if len(batch)==self.batch_size:
+                        yield batch
+                        step += 1
+                        if step >= self.stop:
+                            return
+                        batch = []
+                skip = 0
+            if batch:
+                yield batch
+                step += 1
 
     def __len__(self):
-        return self.stop - self.start
+        return self.stop-self.start
 
 
 def worker_init(worker_id):
@@ -105,9 +124,9 @@ class Trainer:
             torch.manual_seed(1729)
             self.model.eval()
             for task in sorted(self.validation_dataset.task_ranges):
-                sampler = StepBatchSampler(len(self.validation_dataset),self.config.train.batch_size,0,
+                sampler = EpochBatchSampler(len(self.validation_dataset),self.config.train.batch_size,0,
                     self.config.train.validation_batches,1729,
-                    {task:self.validation_dataset.task_ranges[task]},{task:1.})
+                    ranges=self.validation_dataset.task_ranges[task])
                 loader = DataLoader(self.validation_dataset,batch_sampler=sampler,collate_fn=collate_motion,num_workers=0)
                 totals = {}
                 for batch in loader:
@@ -134,7 +153,7 @@ class Trainer:
                 raise ValueError(f"Resume training setting changed: {key}")
         current_model = self.config.to_dict()["model"]
         for key, value in obj["config"]["model"].items():
-            if key not in {"t5_path", "text_cache_dir", "stats_path", "dynamic_stats_path"} and current_model[key] != value:
+            if key not in {"t5_path", "stats_path", "dynamic_stats_path"} and current_model[key] != value:
                 raise ValueError(f"Resume model setting changed: {key}")
         self.model.load_state_dict(obj["model"])
         self.optimizer.load_state_dict(obj["optimizer"])
@@ -149,9 +168,8 @@ class Trainer:
         out.mkdir(parents=True, exist_ok=True)
         (out / "config.json").write_text(json.dumps(self.config.to_dict(), indent=2))
         (out / "metadata.json").write_text(json.dumps(metadata(self.model, self.config, self.dataset), indent=2))
-        sampler = StepBatchSampler(len(self.dataset), cfg.batch_size,
-            self.step * cfg.accumulation_steps, cfg.steps * cfg.accumulation_steps, cfg.seed,
-            getattr(self.dataset,'task_ranges',None),self.config.data.task_weights)
+        sampler = EpochBatchSampler(len(self.dataset), cfg.batch_size,
+            self.step * cfg.accumulation_steps, cfg.steps * cfg.accumulation_steps, cfg.seed)
         loader = DataLoader(self.dataset, batch_sampler=sampler, collate_fn=collate_motion,
             num_workers=self.config.data.num_workers, worker_init_fn=worker_init,
             generator=torch.Generator().manual_seed(cfg.seed),
@@ -164,6 +182,7 @@ class Trainer:
         starting_step = self.step
         self.optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
+        samples_seen = 0
         task_metrics = {}
         # Per-microbatch probes measure each task's contribution before gradients
         # from different accumulation steps are combined in parameter.grad.
@@ -186,7 +205,9 @@ class Trainer:
                 raise FloatingPointError("Nonfinite training loss")
             self.scaler.scale(loss / cfg.accumulation_steps).backward()
             accumulated_loss += loss.detach().item() / cfg.accumulation_steps
-            task = batch.get('task',['synthetic'])[0]
+            samples_seen += len(batch['motion_future'])
+            tasks = set(batch.get('task',[]))
+            task = next(iter(tasks)) if len(tasks)==1 else 'mixed'
             current = task_metrics.setdefault(task,dict(count=0))
             current['count'] += 1
             for name,value in micro_grad_norms.items():
@@ -236,7 +257,7 @@ class Trainer:
         elapsed = time.monotonic()-started
         self.profile = dict(elapsed_seconds=elapsed,optimizer_steps=self.step,
             executed_steps=self.step-starting_step,
-            samples_per_second=(self.step-starting_step)*cfg.batch_size*cfg.accumulation_steps/max(elapsed,1e-9),
+            samples_per_second=samples_seen/max(elapsed,1e-9),
             trainable_parameters=sum(p.numel() for p in self.model.parameters() if p.requires_grad),
             total_parameters=sum(p.numel() for p in self.model.parameters()),
             peak_gpu_memory_bytes=torch.cuda.max_memory_allocated(self.device) if self.device.type=='cuda' else None)

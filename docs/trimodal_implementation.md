@@ -4,13 +4,13 @@
 
 ## M1：Release 与窗口契约
 
-文件：新增 `src/msc/data/release_dataset.py`、`temporal.py`；修改 `data/collator.py`、`cache_text.py`、`factory.py`、`config.py`，供既有训练框架使用。相关测试集中于 `tests/test_trimodal.py`。
+文件：新增 `src/msc/data/release_dataset.py`、`temporal.py`；修改 `data/collator.py`、`factory.py`、`config.py`，供既有训练框架使用。相关测试集中于 `tests/test_trimodal.py`。
 
 - `k` 为第一帧 future；从 `row_start+k-5` 读取恰好 35 帧。通过临时 Record 视图复用现有 `read_motion`，只读取相交 Row Groups，支持跨组窗口，不读取完整 Motion。FK 与 MSC Codec 使用同一历史末帧 Anchor。
-- 从 provenance 读取正式 Label，校验父子 Motion、Actor、Sequence、Split；对多个 Release 联合审计源序列、分组、歌曲 checksum/source ID，发现泄漏时拒绝训练。
+- 发布时从 provenance 读取正式 Label 并构建 training/ 索引；父子 Motion、Actor、Sequence、Split 和歌曲身份在发布/validate 阶段检查。多库 index 命令执行一次跨库审计。
 - 索引确定窗口及对应 Annotation/Link/Feature；任务池不接收缺失或无效条件的窗口。默认要求完整 future 覆盖，音视频上下文为 0.25 秒。`__getitem__` 不抽随机数。
-- 特征、motion 窗口缓存有逐 Worker 字节上限。Worker 使用 spawn，避免继承 Arrow/线程状态。预计算 T5 按文本内容去重，缓存 manifest 记录真实输出维度、预处理及 checkpoint 指纹，训练不加载 Encoder。
-- 训练身份包含 manifest/六表 metadata SHA256、payload 的 size/mtime 签名、Label/对齐策略、实际窗口池及特征身份；不通过扫描整个 Motion Shard 计算 payload hash。这能检查替换/改写，不能识别刻意保留 size/mtime 的 payload 篡改。
+- 特征、motion 窗口缓存有逐 Worker 字节上限。Worker 使用 spawn，避免继承 Arrow/线程状态。文本由本地冻结 T5 在线编码。
+- training/summary.json 记录六表和 manifest 的 SHA256、索引文件 SHA256、Label、对齐策略和上下文长度；这些文件在发布/validate 阶段核验。训练身份由已发布索引指纹及所选 split/任务/子集配置生成，启动时不重算文件 hash、不读取完整 Inventory、不重新扫描窗口。修改 Release 后须重新运行 index/validate。
 
 真实 AIST++ Release 读取结果：1052 条 Sequence，正式标签为 `tracker_executed`，可用 Audio 窗口 **317,536**，条件覆盖不足排除 **995** 个窗口。读取样本为 history `[5,125]`、future `[30,125]`、MERT `[La,768]`，保留真实 PTS。当前 1052 条 Sequence 全部为 Train；未擅自生成 Val/Test。
 
@@ -52,7 +52,7 @@ PYTHONPATH=src .venv/bin/python -m msc.training.experiments \
 
 ## M4 与未完成项
 
-- **Pending：正式 Text Release 与 T5 Cache。** 已发现并验证本地 本地冻结 T5 checkpoint；真实冻结 Encoder 和缓存接口测试通过，但流水线的 Text Release 尚未发布。没有读取其 work/cache 训练。
+- 正式 Text Release 使用本地冻结 T5 在线编码，不生成文本特征缓存。
 - **Pending：真实 V-JEPA features、K/D/时段/Actor 验证与 Video 训练。** 已完成合成 Video forward/backward/mask/梯度测试，没有假设真实 V-JEPA 布局或宣称真实视频训练完成。
 - **Pending：独立 Val/Test 与三组损失对照、可靠条件匹配和稳定 SONIC 跟踪。** 不重新划分现有 Release，不把静止/低幅度当成改善。
 - 当前只保留原生训练路径；旧 checkpoint 与训练产物已清理，旧 checkpoint 加载会明确报错。

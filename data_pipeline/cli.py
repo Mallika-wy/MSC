@@ -31,11 +31,22 @@ def main():
     validate = commands.add_parser('validate')
     validate.add_argument('--dataset', type=Path, required=True)
     validate.add_argument('--deep-sample', type=int, default=0)
+    validate.add_argument('--workers', type=int, default=8, help='Parallel motion-shard checks (default: 8)')
+    index = commands.add_parser('index', help='Build compact training indices for existing releases')
+    index.add_argument('--dataset', type=Path, required=True, nargs='+')
+    index.add_argument('--label-policy', default='train_default')
+    index.add_argument('--audio-context-sec', type=float, default=.25)
+    index.add_argument('--video-context-sec', type=float, default=.25)
     package = commands.add_parser('package')
     package.add_argument('--dataset', type=Path, required=True)
     package.add_argument('--out', type=Path, required=True)
     package.add_argument('--mode', choices=['bundle', 'reference'], default='bundle')
     package.add_argument('--features-only', action='store_true', help='Keep media metadata and features without copying raw media')
+
+    resplit = commands.add_parser('resplit', help='Repartition a release by shared songs without rerunning models')
+    resplit.add_argument('--dataset', type=Path, required=True)
+    resplit.add_argument('--ratios', nargs=3, type=float, default=[.8,.1,.1])
+    resplit.add_argument('--seed', type=int, default=0)
 
     crop = commands.add_parser('crop-video', help='Crop a person from source RGB video')
     crop.add_argument('--video', type=Path, required=True)
@@ -62,10 +73,25 @@ def main():
         result = dict(sequences=sequences, actors=actors, output=str(args.output))
     elif args.command == 'validate':
         from data_pipeline.release.validate import validate_release
-        result = validate_release(args.dataset, args.deep_sample)
+        result = validate_release(args.dataset, args.deep_sample, workers=args.workers)
+    elif args.command == 'index':
+        from data_pipeline.release.training_index import build_training_index
+        from data_pipeline.release.validate import audit_release_roots
+        audit_release_roots(args.dataset)
+        result = {}
+        for root in args.dataset:
+            summary = build_training_index(root, label_policy=args.label_policy,
+                                          audio_context_sec=args.audio_context_sec, video_context_sec=args.video_context_sec)
+            if summary is None:
+                parser.error('Release needs train_default provenance or --label-policy')
+            result[str(root)] = {split: entries['allow_estimated']['windows']
+                                 for split, entries in summary['splits'].items()}
     elif args.command == 'package':
         from data_pipeline.release.package import package_release
         result = package_release(args.dataset, args.out, mode=args.mode, include_media=not args.features_only)
+    elif args.command == 'resplit':
+        from data_pipeline.release.splits import resplit_release
+        result = resplit_release(args.dataset, ratios=args.ratios, seed=args.seed)
     elif args.command == 'crop-video':
         import yaml
         from data_pipeline.video import PersonVideoConfig, preprocess_person_video

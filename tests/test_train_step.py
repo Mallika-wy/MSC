@@ -1,18 +1,18 @@
 import copy
 import pytest
 import torch
-from msc.factory import seed_everything, build_model, build_dataset
+from msc.factory import seed_everything, build_model
 from msc.training.trainer import Trainer
 from msc.training.checkpoint import load_checkpoint
 
 
 @pytest.mark.parametrize('accumulation',[1,2])
-def test_checkpoint_resume_matches_continuous(cfg, tmp_path,accumulation):
+def test_checkpoint_resume_matches_continuous(cfg, toy_dataset, tmp_path,accumulation):
     cfg.train.accumulation_steps=accumulation
     cfg.train.steps = 3
     cfg.train.output_dir = str(tmp_path / "continuous")
     seed_everything(cfg.train.seed)
-    data = build_dataset(cfg)
+    data = toy_dataset
     full = Trainer(build_model(cfg, data.audio_metadata), data, cfg)
     full.fit()
     split_cfg = copy.deepcopy(cfg)
@@ -32,11 +32,11 @@ def test_checkpoint_resume_matches_continuous(cfg, tmp_path,accumulation):
     assert load_checkpoint(tmp_path / "resumed/last.pt")["step"] == 3
 
 
-def test_gradient_accumulation(cfg, tmp_path):
+def test_gradient_accumulation(cfg, toy_dataset, tmp_path):
     cfg.train.steps = 2
     cfg.train.accumulation_steps = 2
     cfg.train.output_dir = str(tmp_path)
-    data = build_dataset(cfg)
+    data = toy_dataset
     trainer = Trainer(build_model(cfg, data.audio_metadata), data, cfg)
     trainer.fit()
     assert trainer.step == 2

@@ -16,20 +16,9 @@ def load_model(checkpoint, device="cpu", t5_path=None):
     cfg.model.stats_path = None
     cfg.model.dynamic_stats_path = None
     model = build_model(cfg, obj["metadata"]["audio"],obj['metadata'].get('features'))
-    if t5_path and cfg.data.backend == 'msc_release':
-        from msc.models.conditioning.text import T5TextEncoder
-        encoder = T5TextEncoder(t5_path,frozen=True,max_length=cfg.model.text_max_length)
-        expected = (obj['metadata'].get('features') or {}).get('text')
-        if not expected or encoder.fingerprint != expected['checkpoint_hash'] or encoder.output_dim != expected['output_dim'] or encoder.max_length != expected['max_length']:
-            raise ValueError('Local T5 differs from frozen feature cache provenance')
-        # Offline checkpoints contain adapters only; attach the optional frozen encoder after loading.
-    else:
-        encoder = None
     if model.text_encoder and model.text_encoder.fingerprint != obj["metadata"]["text_model_sha256"]:
         raise ValueError("Local T5 does not match checkpoint")
     model.load_state_dict(obj["model"])
-    if encoder is not None:
-        model.text_encoder = encoder
     model.representation.stats_sha256 = obj["metadata"]["representation"]["stats_sha256"]
     model.dynamic_stats_sha256 = obj['metadata'].get('dynamic_stats_sha256')
     return model.to(device).eval(), cfg, obj["metadata"]
@@ -39,10 +28,8 @@ def main():
     p = argparse.ArgumentParser(description="Generate canonical 125D motion (local files only)")
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--history", help="Tensor .pt [B,5,125]: four history frames plus current state")
-    p.add_argument("--synthetic-history", action="store_true")
     p.add_argument("--text")
     p.add_argument("--audio", help=".pt dict: features, mask, metadata matching the checkpoint")
-    p.add_argument('--text-tokens',help='.pt dict: tokens, mask, encoder metadata')
     p.add_argument('--video',help='.pt dict: tokens, mask, intervals, feature metadata')
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--cfg-scale", type=float, default=1.0)
@@ -57,27 +44,18 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output", default=".runs/sample.pt")
     args = p.parse_args()
-    if bool(args.history) == bool(args.synthetic_history):
-        p.error("Choose exactly one of --history or --synthetic-history")
+    if not args.history:
+        p.error("--history is required")
     torch.set_num_threads(2)
     seed_everything(args.seed)
     model, cfg, metadata = load_model(args.checkpoint, args.device, args.t5_path)
-    if args.synthetic_history:
-        from msc.data.synthetic import SyntheticDataset
-        history = SyntheticDataset()[0]["motion_history"][None]
-    else:
-        history = torch.load(args.history, map_location="cpu", weights_only=True)
+    history = torch.load(args.history, map_location="cpu", weights_only=True)
     if bool(args.previous_motion) != (args.rtc_mode != "off"):
         p.error("--previous-motion is required exactly when --rtc-mode is not off")
     kwargs = {}
     if args.audio:
         audio = torch.load(args.audio, map_location=args.device, weights_only=True)
         kwargs = dict(audio=audio.get('tokens',audio.get('features')), audio_mask=audio["mask"], audio_times=audio['times'],audio_metadata=audio["metadata"])
-    if args.text_tokens:
-        text = torch.load(args.text_tokens,map_location=args.device,weights_only=True)
-        if text['metadata'] != (metadata.get('features') or {}).get('text'):
-            raise ValueError('Text feature provenance differs from checkpoint')
-        kwargs.update(text_features=text['tokens'],text_mask=text['mask'])
     if args.video:
         video = torch.load(args.video,map_location=args.device,weights_only=True)
         if video['metadata'] != metadata.get('features'):

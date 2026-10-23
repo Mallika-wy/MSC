@@ -2,10 +2,8 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("text,audio", [(True, False), (False, True), (True, True), (False, False)])
-def test_modalities(model, batch, text, audio):
-    if not text:
-        batch.pop("text_features")
+@pytest.mark.parametrize("audio", [True, False])
+def test_modalities(model, batch, audio):
     if not audio:
         batch.pop("audio_features")
     out = model(torch.randn(4, 30, 125), torch.rand(4), batch)
@@ -19,7 +17,6 @@ def test_masked_condition_values_irrelevant(model, batch):
     expected = model(x, t, batch)
     changed = dict(batch)
     changed["audio_features"] = batch["audio_features"].masked_fill(~batch["audio_mask"][..., None], float("nan"))
-    changed["text_features"] = batch["text_features"].masked_fill(~batch["text_mask"][..., None], float("nan"))
     torch.testing.assert_close(model(x, t, changed), expected)
 
 

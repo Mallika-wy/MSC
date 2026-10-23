@@ -21,11 +21,9 @@ class ModelConfig:
     text_dim: int = 768
     use_text: bool = True
     use_audio: bool = True
-    text_backend: str = "t5"
     t5_path: str | None = None
     freeze_text: bool = True
     text_max_length: int = 50
-    text_cache_dir: str | None = None
     text_dropout: float = 0.1
     audio_dropout: float = 0.1
     history_dropout: float = 0.0
@@ -38,11 +36,8 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    backend: str = "synthetic"
-    root: str | None = None
+    backend: str = "msc_release"
     split: str = "train"
-    size: int = 32
-    limit_size: int | None = None
     num_workers: int = 0
     roots: list[str] = field(default_factory=list)
     label_policy: str = 'train_default'
@@ -50,7 +45,7 @@ class DataConfig:
     audio_context_sec: float = .25
     video_context_sec: float = .25
     cache_bytes: int = 134217728
-    task_weights: dict = field(default_factory=lambda: dict(text=.5,audio=.5,video=0.))
+    tasks: list[str] = field(default_factory=lambda: ['text','audio'])
     max_motions_per_task: int | None = None
     max_windows_per_motion: int | None = None
 
@@ -87,12 +82,10 @@ class Config:
 
     def validate(self):
         m, d, t = self.model, self.data, self.train
-        if d.backend not in {"synthetic", "msc_release"} or m.text_backend not in {"synthetic", "t5", "precomputed"}:
-            raise ValueError("Unknown data or text backend")
-        if m.use_text and m.text_backend == "t5" and not m.t5_path and d.backend != 'msc_release':
+        if d.backend != "msc_release":
+            raise ValueError("Unknown data backend")
+        if m.condition.get('text',{}).get('enabled',m.use_text) and not m.t5_path:
             raise ValueError("model.t5_path is required for local T5")
-        if m.text_cache_dir and not m.freeze_text:
-            raise ValueError("Text cache requires frozen T5")
         if not m.freeze_text:
             raise ValueError('Trimodal encoder training is disabled')
         if (m.representation,m.fps,m.history_frames,m.future_frames) != ('g1_canonical_125d',30,5,30):
@@ -105,8 +98,8 @@ class Config:
             raise ValueError('Unknown alignment policy')
         if d.cache_bytes < 0 or min(d.audio_context_sec,d.video_context_sec) < 0:
             raise ValueError('Cache/context must be nonnegative')
-        if set(d.task_weights)-{'text','audio','video','motion_only'} or any(not isinstance(v,(int,float)) or not math.isfinite(v) or v<0 for v in d.task_weights.values()) or sum(d.task_weights.values())<=0:
-            raise ValueError('Invalid task weights')
+        if not d.tasks or len(d.tasks)!=len(set(d.tasks)) or set(d.tasks)-{'text','audio','video','motion_only'}:
+            raise ValueError('Invalid data tasks')
         if m.condition.get('temporal_bias','relative_distance') not in {'none','relative_distance'}:
             raise ValueError('Unknown temporal bias')
         if m.condition.get('history_dropout',m.history_dropout) != 0:
@@ -121,7 +114,7 @@ class Config:
                 raise ValueError(f'Unknown {name} condition configuration key')
             if c.get('frozen',True) is not True or not 0 <= c.get('dropout',.1) <= 1:
                 raise ValueError('Encoders must be frozen with valid condition dropout')
-            if c.get('enabled',{'text':m.use_text,'audio':m.use_audio,'video':False}[name]) is False and d.backend=='msc_release' and d.task_weights.get(name,0)>0:
+            if c.get('enabled',{'text':m.use_text,'audio':m.use_audio,'video':False}[name]) is False and d.backend=='msc_release' and name in d.tasks:
                 raise ValueError(f'{name} task is sampled but its adapter is disabled')
         if m.condition.get('audio',{}).get('dim',768) != 768:
             raise ValueError('Audio dimension must be 768 for MERT')
@@ -143,12 +136,12 @@ class Config:
         if t.precision not in {"fp32", "bf16", "fp16"}:
             raise ValueError("precision must be fp32, bf16 or fp16")
         for value in (m.hidden_dim, m.num_layers, m.num_heads, m.text_dim, m.text_max_length,
-                      d.size, t.steps, t.batch_size, t.accumulation_steps, t.schedule_steps,
+                      t.steps, t.batch_size, t.accumulation_steps, t.schedule_steps,
                       t.checkpoint_every, t.log_every, t.num_threads):
             if not isinstance(value, int) or value <= 0:
                 raise ValueError("Dimensions, batch sizes and step intervals must be positive integers")
-        if d.num_workers < 0 or (d.limit_size is not None and d.limit_size <= 0):
-            raise ValueError("Invalid data worker count or limit_size")
+        if d.num_workers < 0:
+            raise ValueError("Invalid data worker count")
         if not 0 <= t.warmup_steps < t.schedule_steps or t.learning_rate <= 0 or t.max_grad_norm <= 0:
             raise ValueError("Invalid optimizer/scheduler settings")
         if not 0 <= m.dropout < 1:

@@ -21,7 +21,6 @@ msc-train = "msc.train:main"
 msc-sample = "msc.sample:main"
 msc-execute = "msc.execute:main"
 msc-evaluate = "msc.evaluate:main"
-msc-cache-text = "msc.cache_text:main"
 msc-data = "data_pipeline.cli:main"
 
 [tool.setuptools]
@@ -38,4 +37,4 @@ msc = ["assets/stats/*.json", "assets/robots/g1/*.json", "assets/robots/g1/*.urd
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: requires local MSC Releases or T5 assets", "slow: synthetic convergence test"]
+markers = ["integration: requires local MSC Releases or T5 assets"]

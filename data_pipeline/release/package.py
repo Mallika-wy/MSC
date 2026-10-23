@@ -14,11 +14,14 @@ from .validate import validate_release
 
 def finalize_output(output):
     """Keep an independently readable training release and remove processing data."""
+    import pyarrow.parquet as pq
     output = Path(output).resolve()
     root, staged, previous = output / 'release', output / '.release-bundle', output / '.release-reference'
-    package_release(root, staged, include_media=False)
-    inv = Inventory.read(staged)
-    report = validate_release(staged, deep_sample=max(len(inv.motions), len(inv.features)))
+    if not staged.exists():
+        package_release(root, staged, include_media=False)
+    depth = max(pq.read_metadata(staged / 'meta' / f'{table}.parquet').num_rows
+                for table in ('motions', 'features'))
+    report = validate_release(staged, deep_sample=depth)
     (staged / 'reports/dataset_summary.json').write_text(json.dumps(report, indent=2))
     root.rename(previous)
     try:

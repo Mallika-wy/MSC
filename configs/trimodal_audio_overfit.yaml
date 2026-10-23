@@ -1,10 +1,9 @@
-# Real paired Audio overfit; existing AIST++ Release currently contains Train only.
+# Real paired Audio overfit using the AIST++ Train split.
 model:
   hidden_dim: 512
   num_layers: 6
   num_heads: 8
   ffn_dim: 2048
-  text_backend: precomputed
   use_text: false
   condition:
     fusion: token_cross_attention
@@ -25,7 +24,7 @@ data:
   split: train
   label_policy: train_default
   alignment_policy: allow_estimated
-  task_weights: {audio: 1.0}
+  tasks: [audio]
   num_workers: 2
   max_motions_per_task: 8
   max_windows_per_motion: 16
