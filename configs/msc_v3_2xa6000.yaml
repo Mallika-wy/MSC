@@ -58,6 +58,7 @@ train:
   batch_size: 1152
   accumulation_steps: 1
   learning_rate: 0.0001
+  min_learning_rate: 0.000001
   warmup_steps: 1000
   schedule_steps: 30000
   steps: 30000
@@ -71,3 +72,4 @@ train:
   validation_motions_per_task: 128
   compile_expert: true
   bf16_gradient_reduce: true
+  wandb_project: msc-v3

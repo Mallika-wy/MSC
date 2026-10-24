@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from .distributed import RankBatchSampler, TrainingLoss
+from .tracking import flatten_metrics, offline_run
 from torch.utils.data import DataLoader, Sampler
 from msc.data.collator import collate_motion
 from msc.factory import to_device, build_dataset
@@ -101,7 +102,8 @@ class Trainer:
             if step < cfg.warmup_steps:
                 return (step + 1) / max(1, cfg.warmup_steps)
             progress = min(1.0, (step - cfg.warmup_steps) / (cfg.schedule_steps - cfg.warmup_steps))
-            return 0.5 * (1 + math.cos(math.pi * progress))
+            floor = cfg.min_learning_rate / cfg.learning_rate
+            return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * progress))
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, schedule)
         self.scaler = torch.amp.GradScaler("cuda", enabled=cfg.precision == "fp16")
         self.step = 0
@@ -182,6 +184,13 @@ class Trainer:
         restore_rng(obj["rng"])
 
     def fit(self):
+        tracking = contextlib.nullcontext()
+        if self.rank == 0 and self.config.train.wandb_project:
+            tracking = offline_run(self.config)
+        with tracking as run:
+            return self._fit(run)
+
+    def _fit(self, run=None):
         cfg = self.config.train
         out = Path(cfg.output_dir)
         if self.rank == 0:
@@ -298,6 +307,8 @@ class Trainer:
                     print(json.dumps(record), flush=True)
                     with (out/'metrics.jsonl').open('a') as f:
                         f.write(json.dumps(record)+'\n')
+                    if run is not None:
+                        run.log({'optimizer_step': self.step, **flatten_metrics(record, 'train')})
                 task_metrics = {}
             accumulated_loss = 0.0
             if self.rank == 0 and cfg.validation_every > 0 and self.step % cfg.validation_every == 0:
@@ -305,8 +316,10 @@ class Trainer:
                 if validation:
                     with (out/'validation.jsonl').open('a') as f:
                         f.write(json.dumps(dict(step=self.step,tasks=validation))+'\n')
+                    if run is not None:
+                        run.log({'optimizer_step': self.step, **flatten_metrics(validation, 'val')})
             if self.rank == 0 and (self.step % cfg.checkpoint_every == 0 or self.step == cfg.steps):
-                save_checkpoint(out / "last.pt", self)
+                save_checkpoint(out / "checkpoints" / f"step_{self.step}.pt", self)
             if self.world_size > 1 and (self.step % cfg.checkpoint_every == 0 or
                     (cfg.validation_every > 0 and self.step % cfg.validation_every == 0) or self.step == cfg.steps):
                 dist.barrier()
@@ -332,4 +345,6 @@ class Trainer:
             self.profile['global_samples_per_second'] = sum(p['samples_per_second'] for p in profiles)
             self.profile['rank_peak_gpu_memory_bytes'] = [p['peak_gpu_memory_bytes'] for p in profiles]
             (out/'profile.json').write_text(json.dumps(self.profile, indent=2))
+            if run is not None:
+                run.summary.update(flatten_metrics(self.profile, 'profile'))
         return self.last_loss

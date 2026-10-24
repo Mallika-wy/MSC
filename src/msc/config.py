@@ -62,6 +62,7 @@ class TrainConfig:
     batch_size: int = 4
     accumulation_steps: int = 1
     learning_rate: float = 0.0003
+    min_learning_rate: float = 0.000001
     weight_decay: float = 0.01
     warmup_steps: int = 0
     schedule_steps: int = 1000
@@ -74,6 +75,8 @@ class TrainConfig:
     validation_every: int = 100
     validation_batches: int = 4
     validation_motions_per_task: int | None = None
+    wandb_project: str | None = None
+    wandb_name: str | None = None
 
 
 @dataclass
@@ -146,6 +149,8 @@ class Config:
             raise ValueError("Invalid data worker count")
         if not 0 <= t.warmup_steps < t.schedule_steps or t.learning_rate <= 0 or t.max_grad_norm <= 0:
             raise ValueError("Invalid optimizer/scheduler settings")
+        if not 0 <= t.min_learning_rate <= t.learning_rate:
+            raise ValueError("min_learning_rate must be between zero and learning_rate")
         if not 0 <= m.dropout < 1:
             raise ValueError("dropout must be in [0,1)")
         if not isinstance(m.rtc, bool) or not isinstance(m.max_delay, int) or not 1 <= m.max_delay < 30:
