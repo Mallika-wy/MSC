@@ -55,4 +55,4 @@ def build_model(config, audio_metadata=None, feature_metadata=None):
 
 
 def to_device(batch, device):
-    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+    return {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}

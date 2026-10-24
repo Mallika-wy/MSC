@@ -29,12 +29,11 @@ class ToyDataset(torch.utils.data.Dataset):
         motion = self.representation.denormalize(values)
         length = 23 if index % 5 == 0 else 30
         mask = torch.arange(30) < length
-        has_audio = index % 4 in (1, 2)
         audio_length = 68 + index % 3 * 4
         audio_times = torch.arange(audio_length) / 75
         return dict(motion_history=motion[:5], motion_future=motion[5:], motion_mask=mask,
-                    audio_features=torch.randn(audio_length, 768, generator=gen) * .1,
-                    audio_mask=(audio_times < length / 30) & has_audio, audio_times=audio_times)
+                    audio_tokens=torch.randn(audio_length, 768, generator=gen) * .1,
+                    audio_mask=(audio_times < length / 30), audio_times=audio_times)
 
 
 @pytest.fixture(autouse=True)
@@ -73,4 +72,9 @@ def batch(toy_dataset):
 @pytest.fixture
 def model(cfg, toy_dataset):
     data = toy_dataset
-    return build_model(cfg, data.audio_metadata)
+    model = build_model(cfg, data.audio_metadata)
+    # General conditioning tests exercise a model after the initial zero-gate phase.
+    with torch.no_grad():
+        for layer in model.motion_generator.layers:
+            layer.modulation[-1].bias.view(9, -1)[[2, 5, 8]] = .1
+    return model

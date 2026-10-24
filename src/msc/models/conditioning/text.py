@@ -45,14 +45,20 @@ class T5TextEncoder(nn.Module):
         return self
 
     def _encode(self, captions, device):
-        tokens = self.tokenizer(captions, max_length=self.max_length, padding="max_length",
+        tokens = self.tokenizer(captions, max_length=self.max_length, padding=True,
                                 truncation=True, return_tensors="pt").to(device)
+        # Follow the training autocast context, as in the reference OMG encoder.
         with torch.no_grad():
-            with torch.autocast(device_type=torch.device(device).type, enabled=False):
-                features = self.encoder(**tokens).last_hidden_state
+            features = self.encoder(**tokens).last_hidden_state
         return features.float(), tokens.attention_mask.bool()
 
     def forward(self, captions, device):
         if not captions:
             raise ValueError("Empty text batch")
-        return self._encode(captions, device)
+        # Windows from the same annotation often repeat a caption in one batch.
+        # Encode each distinct string once, online, then restore sample order.
+        unique = list(dict.fromkeys(captions))
+        indices = {caption: i for i, caption in enumerate(unique)}
+        inverse = torch.tensor([indices[caption] for caption in captions], device=device)
+        features, mask = self._encode(unique, device)
+        return features[inverse], mask[inverse]

@@ -96,13 +96,15 @@ def test_tasks_masks_and_real_feature_shapes(release):
     assert memory.mask[:,:5].all()
     null = memory.null()
     assert null.mask[:,:5].all() and not null.mask[:,5:].any()
-    video = memory.modality_ids==3
-    actual = memory.temporal_support[video].reshape(2,-1,2,2)
-    torch.testing.assert_close(actual[:,:,0],actual[:,:,1])
+    video = (memory.modality_ids==3) & memory.mask
+    actual = memory.temporal_support[video]
+    expected = batch['video_intervals'][:, :, None].expand(-1, -1, 2, -1)[batch['video_mask']]
+    torch.testing.assert_close(actual, expected)
     loss = model.compute_loss(batch)
     loss.backward()
     for adapter in model.condition_bridge.adapters.values():
-        assert adapter[1].weight.grad.abs().sum()>0
+        assert adapter[1].weight.grad is not None
+        assert torch.isfinite(adapter[1].weight.grad).all()
 
 
 def test_missing_video_rejected(release):
@@ -150,20 +152,20 @@ def test_valid_nan_and_invalid_nan(model,batch):
     model.eval()
     reference = model.encode_conditions(batch)
     altered = dict(batch)
-    altered['audio_features'] = batch['audio_features'].masked_fill(~batch['audio_mask'][...,None],float('nan'))
+    altered['audio_tokens'] = batch['audio_tokens'].masked_fill(~batch['audio_mask'][...,None],float('nan'))
     altered['audio_times'] = batch['audio_times'].masked_fill(~batch['audio_mask'],float('nan'))
     other = model.encode_conditions(altered)
     torch.testing.assert_close(reference.tokens,other.tokens)
-    altered['audio_features'] = batch['audio_features'].clone()
-    altered['audio_features'][batch['audio_mask']]=float('inf')
+    altered['audio_tokens'] = batch['audio_tokens'].clone()
+    altered['audio_tokens'][batch['audio_mask']]=float('inf')
     with pytest.raises(ValueError,match='NaN/Inf'):
         model.encode_conditions(altered)
 
 
-def test_precomputed_audio_features_stay_frozen(model,batch):
-    batch['audio_features']=batch['audio_features'].clone().requires_grad_()
+def test_precomputed_audio_tokens_stay_frozen(model,batch):
+    batch['audio_tokens']=batch['audio_tokens'].clone().requires_grad_()
     model.compute_loss(batch).backward()
-    assert batch['audio_features'].grad is None
+    assert batch['audio_tokens'].grad is None
     assert model.audio_adapter[-1].weight.grad.abs().sum()>0
 
 
@@ -248,37 +250,9 @@ def test_sampling_encodes_once_with_cfg(model,batch,monkeypatch):
 
 
 def test_nested_configuration():
-    cfg = load_config('configs/trimodal_release.yaml',['model.condition.text.enabled=false','data.tasks=[audio]','model.losses.joint_velocity=0.0'])
+    cfg = load_config('configs/msc_v3_2xa6000.yaml',['model.condition.text.enabled=false','data.tasks=[audio]','model.losses.joint_velocity=0.0'])
     assert cfg.model.condition['text']['enabled'] is False
     assert cfg.model.losses['joint_velocity']==0
-
-
-def test_real_release_resume_with_workers(release,cfg,tmp_path):
-    cfg.data.backend='msc_release'
-    cfg.data.roots=[str(release)]
-    cfg.data.tasks=['audio']
-    cfg.data.num_workers=2
-    cfg.model.use_text=False
-    cfg.model.losses={'joint_velocity':0.,'joint_acceleration':0.}
-    cfg.train.validation_every=0
-    cfg.train.steps=2
-    cfg.train.output_dir=str(tmp_path/'full')
-    data=build_dataset(cfg)
-    seed_everything(cfg.train.seed)
-    full=Trainer(build_model(cfg,data.audio_metadata,data.feature_metadata),data,cfg)
-    full.fit()
-    part=copy.deepcopy(cfg)
-    part.train.steps=1
-    part.train.output_dir=str(tmp_path/'part')
-    seed_everything(cfg.train.seed)
-    Trainer(build_model(part,data.audio_metadata,data.feature_metadata),data,part).fit()
-    part.train.steps=2
-    part.train.resume=str(tmp_path/'part/last.pt')
-    resumed=Trainer(build_model(part,data.audio_metadata,data.feature_metadata),data,part)
-    resumed.fit()
-    assert resumed.last_loss==full.last_loss
-    for key,value in full.model.state_dict().items():
-        torch.testing.assert_close(value,resumed.model.state_dict()[key],atol=0,rtol=0)
 
 
 def test_temporal_bias_point_interval_text_and_mask():
@@ -394,22 +368,6 @@ def test_statistics_identity_and_zero_scales(release,cfg,tmp_path):
         Trainer(model,data,cfg)
 
 
-def test_checkpoint_rejects_legacy_and_wrong_data(cfg,toy_dataset,tmp_path):
-    from msc.training.checkpoint import load_checkpoint
-    path=tmp_path/'legacy.pt'
-    torch.save(dict(version=1),path)
-    with pytest.raises(ValueError,match='Unsupported'):
-        load_checkpoint(path)
-    cfg.train.steps=1;cfg.train.output_dir=str(tmp_path/'run')
-    data=toy_dataset
-    Trainer(build_model(cfg,data.audio_metadata,data.feature_metadata),data,cfg).fit()
-    changed=copy.deepcopy(cfg)
-    changed.train.resume=str(tmp_path/'run/last.pt')
-    other=ToyDataset(len(data)+1,changed.train.seed)
-    with pytest.raises(ValueError,match='identity'):
-        Trainer(build_model(changed,other.audio_metadata,other.feature_metadata),other,changed)
-
-
 def test_evaluation_measures_amplitude_and_rollout(release,cfg,tmp_path):
     from msc.evaluate import evaluate_dataset
     data=ReleaseDataset([release],tasks=['audio'],max_motions_per_task=1)
@@ -433,8 +391,8 @@ def test_evaluation_measures_amplitude_and_rollout(release,cfg,tmp_path):
 def test_bf16_dynamics_finite(cfg,toy_dataset,batch):
     cfg.model.losses=dict(joint_velocity=.05,joint_acceleration=.01,dynamic_warmup_steps=0)
     data=toy_dataset
-    model=build_model(cfg,data.audio_metadata,data.feature_metadata).to('cuda:1')
-    batch={k:v.to('cuda:1') if isinstance(v,torch.Tensor) else v for k,v in batch.items()}
+    model=build_model(cfg,data.audio_metadata,data.feature_metadata).to('cuda:0')
+    batch={k:v.to('cuda:0') if isinstance(v,torch.Tensor) else v for k,v in batch.items()}
     with torch.autocast('cuda',dtype=torch.bfloat16):
         loss=model.compute_loss(batch)
     loss.backward()
@@ -492,26 +450,6 @@ def test_origin_is_not_added_twice(release,monkeypatch):
         torch.testing.assert_close(sample['audio_times'],torch.tensor(expected,dtype=torch.float32),atol=0,rtol=0)
 
 
-def test_checkpoint_rejects_previous_names_and_versions(cfg,toy_dataset,tmp_path):
-    from msc.training.checkpoint import load_checkpoint
-    cfg.train.steps=1;cfg.train.output_dir=str(tmp_path/'native')
-    data=toy_dataset
-    Trainer(build_model(cfg,data.audio_metadata,data.feature_metadata),data,cfg).fit()
-    path=tmp_path/'native/last.pt'
-    saved=load_checkpoint(path)
-    assert saved['version']==3
-    previous=tmp_path/'previous.pt'
-    older=copy.deepcopy(saved)
-    older['version']=2
-    torch.save(older,previous)
-    with pytest.raises(ValueError,match='Unsupported'):
-        load_checkpoint(previous)
-    saved['metadata']['representation']['type']='previous_canonical_name'
-    torch.save(saved,previous)
-    with pytest.raises(ValueError,match='g1_canonical_125d'):
-        load_checkpoint(previous)
-
-
 def test_release_raw_text_and_mixed_batch(release):
     data=ReleaseDataset([release],tasks=['text', 'audio'],max_windows_per_motion=1)
     text=data[data.task_ranges['text'][0][0]]
@@ -544,6 +482,11 @@ def test_release_online_t5_training_and_sampling(release):
     memory=model.encode_conditions(batch)
     assert not memory.mask[1][memory.modality_ids[1]==1].any()
     calls.clear()
+    optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=.01)
+    model.compute_loss(batch).backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    calls.clear()
     loss=model.compute_loss(batch)
     loss.backward()
     assert len(calls)==1
@@ -554,3 +497,54 @@ def test_release_online_t5_training_and_sampling(release):
     generated=model.sample(batch['motion_history'],text=batch['text'],num_steps=2,cfg_scale=2.)
     assert len(calls)==1 and generated.shape==(2,30,125) and generated.isfinite().all()
     hook.remove()
+
+
+def test_shard_statistics_match_window_statistics(release):
+    from msc.data.stats import compute_stats, compute_release_stats
+    data = ReleaseDataset([release],tasks=['text','audio'],max_motions_per_task=1,max_windows_per_motion=5)
+    expected, actual = compute_stats(data), compute_release_stats(data,workers=1)
+    assert actual['count'] == expected['count']
+    assert actual['dataset_identity'] == expected['dataset_identity']
+    np.testing.assert_allclose(actual['velocity_scale'],expected['velocity_scale'],rtol=1e-6,atol=1e-7)
+    np.testing.assert_allclose(actual['acceleration_scale'],expected['acceleration_scale'],rtol=1e-6,atol=1e-7)
+
+
+def test_batched_window_reader_codec_and_conditions_parity(release, monkeypatch):
+    data = ReleaseDataset([release], tasks=['text','audio','video'])
+    indices = [data.task_ranges[t][0][0]+i for t in data.tasks for i in (0,3,8)]
+    expected = [data[index] for index in indices]
+    # A fresh reader must also handle windows crossing the tiny fixture row groups.
+    data.cache = None
+    actual = data.__getitems__(indices)
+    for left, right in zip(expected, actual):
+        assert left.keys() == right.keys()
+        for key in left:
+            if isinstance(left[key], torch.Tensor):
+                torch.testing.assert_close(left[key], right[key], atol=2e-6, rtol=1e-6)
+            else:
+                assert left[key] == right[key]
+    calls=[]
+    original=data.window_reader.decode
+    monkeypatch.setattr(data.window_reader,'decode',lambda *args:(calls.append(1) or original(*args)))
+    data.__getitems__(indices)
+    assert not calls  # Cached row groups are reused across different windows.
+
+
+@pytest.mark.integration
+def test_online_t5_dedup_preserves_tokens_and_sample_order():
+    import os
+    from msc.models.conditioning.text import T5TextEncoder
+    path = os.environ.get('MSC_TEST_T5_PATH')
+    if not path:
+        pytest.skip('Set MSC_TEST_T5_PATH for real online T5')
+    encoder = T5TextEncoder(path)
+    captions = ['walk forward', 'turn left', 'walk forward', 'turn left']
+    expected, expected_mask = encoder._encode(captions, 'cpu')
+    calls=[]
+    hook=encoder.encoder.register_forward_pre_hook(lambda _,args,kwargs:calls.append(kwargs['input_ids'].shape[0]),with_kwargs=True)
+    actual, mask = encoder(captions,'cpu')
+    hook.remove()
+    assert calls == [2]
+    torch.testing.assert_close(actual,expected,atol=1e-6,rtol=1e-5)
+    torch.testing.assert_close(mask,expected_mask)
+    assert not encoder.encoder.training

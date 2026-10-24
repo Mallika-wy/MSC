@@ -10,9 +10,9 @@ from .losses import dynamics_loss
 
 
 class MSCModel(nn.Module):
-    architecture_version = 'trimodal_flow_v2'
+    architecture_version = 'msc_v3'
 
-    def __init__(self, *, hidden_dim=512, num_layers=6, num_heads=8, dropout=.1,
+    def __init__(self, *, hidden_dim=1024, num_layers=12, num_heads=16, dropout=.1,
                  text_dim=768, text_encoder=None, use_text=True, use_audio=True,
                  text_dropout=.1, audio_dropout=.1, history_dropout=0.,
                  stats_path=None, audio_metadata=None, rtc=False, max_delay=8,
@@ -62,7 +62,7 @@ class MSCModel(nn.Module):
     def audio_adapter(self):
         return self.condition_bridge.adapters['audio'] if 'audio' in self.condition_bridge.adapters else None
 
-    def encode_conditions(self,batch):
+    def encode_conditions(self,batch, *, require_external=False):
         history = batch['motion_history']
         if history.ndim != 3 or history.shape[1:] != (5,125) or not torch.isfinite(history).all():
             raise ValueError('history must be finite canonical [B,5,125]')
@@ -73,7 +73,7 @@ class MSCModel(nn.Module):
             batch['text_tokens'],batch['text_mask'] = self.text_encoder(batch['text'],history.device)
             has_text = torch.tensor([bool(text.strip()) for text in batch['text']],device=history.device)
             batch['text_mask'] &= has_text[:,None]
-        return self.condition_bridge(batch,self.representation.normalize(history))
+        return self.condition_bridge(batch,self.representation.normalize(history), require_external=require_external)
 
     def conditions(self,batch,*,drop_modalities=False):
         memory = self.encode_conditions(batch)
@@ -91,7 +91,7 @@ class MSCModel(nn.Module):
         if not torch.isfinite(future[mask]).all():
             raise ValueError('Valid motion contains NaN/Inf')
         data = self.representation.normalize(future.masked_fill(~mask[...,None],0))
-        details = self.flow.loss(self.motion_generator,data,self.encode_conditions(batch),mask,
+        details = self.flow.loss(self.motion_generator,data,self.encode_conditions(batch, require_external=True),mask,
             noise=noise,times=times,rtc_training=self.rtc,max_delay=self.max_delay,delays=rtc_delays,return_details=True)
         flow = details['loss']
         vel,acc = flow*0,flow*0
@@ -109,21 +109,16 @@ class MSCModel(nn.Module):
         return total
 
     @torch.no_grad()
-    def sample(self, history, text=None, audio=None, *, audio_mask=None, audio_metadata=None,
-               audio_tokens=None,
+    def sample(self, history, text=None, *, audio_tokens=None, audio_mask=None, audio_metadata=None,
                audio_times=None, video_tokens=None,
                video_mask=None, video_intervals=None, num_steps=10, cfg_scale=1.0, initial_noise=None,
                previous_motion=None, rtc_mode="off", inference_delay=0, execution_horizon=None,
                rtc_mask_schedule="exponential", rtc_guidance_alpha=0.9):
-        if audio_tokens is not None:
-            if audio is not None:
-                raise ValueError('Supply only audio_tokens or legacy audio')
-            audio = audio_tokens
         if text is not None and self.text_adapter is None:
             raise ValueError("Text conditioning is disabled in this model")
-        if audio is not None and self.audio_adapter is None:
+        if audio_tokens is not None and self.audio_adapter is None:
             raise ValueError("Audio conditioning is disabled in this model")
-        if audio is not None and (self.audio_metadata is None or audio_metadata != self.audio_metadata):
+        if audio_tokens is not None and (self.audio_metadata is None or audio_metadata != self.audio_metadata):
             raise ValueError("Audio provenance must match the checkpoint metadata")
         was_training = self.training
         self.eval()
@@ -135,8 +130,8 @@ class MSCModel(nn.Module):
                 if len(text) != len(history):
                     raise ValueError("One caption per history sample is required")
                 batch["text"] = text
-            if audio is not None:
-                batch.update(audio_tokens=audio, audio_mask=audio_mask, audio_times=audio_times)
+            if audio_tokens is not None:
+                batch.update(audio_tokens=audio_tokens, audio_mask=audio_mask, audio_times=audio_times)
             if video_tokens is not None:
                 batch.update(video_tokens=video_tokens, video_mask=video_mask, video_intervals=video_intervals)
             cond = self.conditions(batch)

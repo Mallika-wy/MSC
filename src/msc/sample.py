@@ -55,7 +55,7 @@ def main():
     kwargs = {}
     if args.audio:
         audio = torch.load(args.audio, map_location=args.device, weights_only=True)
-        kwargs = dict(audio=audio.get('tokens',audio.get('features')), audio_mask=audio["mask"], audio_times=audio['times'],audio_metadata=audio["metadata"])
+        kwargs = dict(audio_tokens=audio['tokens'], audio_mask=audio["mask"], audio_times=audio['times'],audio_metadata=audio["metadata"])
     if args.video:
         video = torch.load(args.video,map_location=args.device,weights_only=True)
         if video['metadata'] != metadata.get('features'):

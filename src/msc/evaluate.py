@@ -68,9 +68,9 @@ def evaluate_dataset(model,dataset,*,batches=4,batch_size=4,device='cpu',output_
             alternatives = list(task_indices(dataset,task,bi+2,len(indices)))[-1]
             control = to_device(collate_motion([dataset[i] for i in alternatives]),device)
             for key in list(shuffled):
-                if key.startswith(('text_','audio_','video_')):
+                if key == 'text' or key.startswith(('text_','audio_','video_')):
                     shuffled.pop(key)
-            shuffled.update({k:v for k,v in control.items() if k.startswith(('text_','audio_','video_'))})
+            shuffled.update({k:v for k,v in control.items() if k == 'text' or k.startswith(('text_','audio_','video_'))})
             shuffled_pred = sample_batch(model,shuffled,noise)
             memory = model.encode_conditions(batch)
             missing_pred = model.representation.denormalize(model.flow.sample(model.motion_generator,memory.null(),initial_noise=noise))
@@ -167,7 +167,7 @@ def main():
     p.add_argument('--batches',type=int,default=4)
     p.add_argument('--device',default='cpu')
     p.add_argument('--t5-path')
-    p.add_argument('--output',default='.runs/trimodal-evaluation')
+    p.add_argument('--output',default='.runs/msc-v3-evaluation')
     p.add_argument('--sonic-config')
     p.add_argument('--rollout-chunks',type=int,default=2)
     args = p.parse_args()

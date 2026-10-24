@@ -6,6 +6,9 @@ import time
 import os
 from pathlib import Path
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from .distributed import RankBatchSampler, TrainingLoss
 from torch.utils.data import DataLoader, Sampler
 from msc.data.collator import collate_motion
 from msc.factory import to_device, build_dataset
@@ -77,6 +80,8 @@ class Trainer:
     def __init__(self, model, dataset, config):
         self.config, self.dataset = config, dataset
         cfg = config.train
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG',':4096:8')
         torch.use_deterministic_algorithms(cfg.deterministic)
         torch.backends.cudnn.benchmark = False
@@ -91,7 +96,7 @@ class Trainer:
             raise ValueError("BF16 is not supported on this device")
         self.amp_dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[cfg.precision]
         self.optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                                          lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+                                          lr=cfg.learning_rate, weight_decay=cfg.weight_decay, fused=self.device.type=='cuda')
         def schedule(step):
             if step < cfg.warmup_steps:
                 return (step + 1) / max(1, cfg.warmup_steps)
@@ -103,7 +108,7 @@ class Trainer:
         self.last_loss = None
         self.profile = {}
         self.validation_dataset = None
-        if config.data.backend == 'msc_release' and cfg.validation_every > 0:
+        if self.rank == 0 and config.data.backend == 'msc_release' and cfg.validation_every > 0:
             val_config = copy.deepcopy(config)
             val_config.data.split = 'val'
             val_config.data.max_motions_per_task = cfg.validation_motions_per_task
@@ -113,6 +118,20 @@ class Trainer:
                 raise ValueError('Train dynamics statistics do not match selected Release dataset')
         if cfg.resume:
             self.resume(cfg.resume)
+        if cfg.compile_expert:
+            # Compile in place: parameter names and the saved model stay unchanged.
+            self.model.motion_generator.compile(dynamic=True)
+        self.training_model = TrainingLoss(self.model)
+        if self.world_size > 1:
+            # Different tasks can leave different adapters unused on each rank.
+            self.training_model = DistributedDataParallel(
+                self.training_model,
+                device_ids=[self.device.index] if self.device.type == 'cuda' else None,
+                find_unused_parameters=True, broadcast_buffers=False, gradient_as_bucket_view=True)
+            if cfg.bf16_gradient_reduce:
+                from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook
+                self.training_model.register_comm_hook(None, bf16_compress_hook)
+        torch.manual_seed(cfg.seed + self.rank)
 
     @torch.no_grad()
     def validate(self):
@@ -165,14 +184,18 @@ class Trainer:
     def fit(self):
         cfg = self.config.train
         out = Path(cfg.output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "config.json").write_text(json.dumps(self.config.to_dict(), indent=2))
-        (out / "metadata.json").write_text(json.dumps(metadata(self.model, self.config, self.dataset), indent=2))
-        sampler = EpochBatchSampler(len(self.dataset), cfg.batch_size,
+        if self.rank == 0:
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "config.json").write_text(json.dumps(self.config.to_dict(), indent=2))
+            (out / "metadata.json").write_text(json.dumps(metadata(self.model, self.config, self.dataset), indent=2))
+        sampler = EpochBatchSampler(len(self.dataset), cfg.batch_size * self.world_size,
             self.step * cfg.accumulation_steps, cfg.steps * cfg.accumulation_steps, cfg.seed)
+        if self.world_size > 1:
+            sampler = RankBatchSampler(sampler, self.rank, self.world_size, cfg.batch_size)
         loader = DataLoader(self.dataset, batch_sampler=sampler, collate_fn=collate_motion,
+            pin_memory=self.device.type == 'cuda',
             num_workers=self.config.data.num_workers, worker_init_fn=worker_init,
-            generator=torch.Generator().manual_seed(cfg.seed),
+            generator=torch.Generator().manual_seed(cfg.seed+self.rank),
             multiprocessing_context='spawn' if self.config.data.num_workers else None)
         self.model.train()
         if self.device.type=='cuda':
@@ -184,6 +207,7 @@ class Trainer:
         accumulated_loss = 0.0
         samples_seen = 0
         task_metrics = {}
+        task_samples = {}
         # Per-microbatch probes measure each task's contribution before gradients
         # from different accumulation steps are combined in parameter.grad.
         micro_grad_norms = {}
@@ -192,20 +216,29 @@ class Trainer:
         probes += [(name+'_output',adapter[-1].weight) for name,adapter in self.model.condition_bridge.adapters.items()]
         handles = [p.register_hook(lambda grad,name=name: micro_grad_norms.__setitem__(name,grad.detach().float().norm()))
                    for name,p in probes]
+        data_wait_seconds = 0.
+        last_batch_end = started
         for microstep, batch in enumerate(loader, 1):
+            data_wait_seconds += time.monotonic() - last_batch_end
             micro_grad_norms.clear()
             batch = to_device(batch, self.device)
             absolute_microstep = self.step*cfg.accumulation_steps+(microstep-1)%cfg.accumulation_steps
-            flow_rng = torch.Generator(device=self.device).manual_seed(cfg.seed+1000003+absolute_microstep)
+            flow_rng = torch.Generator(device=self.device).manual_seed(cfg.seed+1000003+absolute_microstep*self.world_size+self.rank)
             noise = torch.randn(batch['motion_future'].shape,device=self.device,generator=flow_rng)
             times = torch.rand(len(noise),device=self.device,generator=flow_rng)
-            with self.autocast():
-                loss, components = self.model.compute_loss(batch,noise=noise,times=times,return_metrics=True,step=self.step)
-            if not torch.isfinite(loss):
-                raise FloatingPointError("Nonfinite training loss")
-            self.scaler.scale(loss / cfg.accumulation_steps).backward()
+            synchronize = microstep % cfg.accumulation_steps == 0
+            sync_context = (self.training_model.no_sync() if self.world_size > 1 and not synchronize
+                            else contextlib.nullcontext())
+            with sync_context:
+                with self.autocast():
+                    loss, components = self.training_model(batch, noise, times, self.step)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Nonfinite training loss")
+                self.scaler.scale(loss / cfg.accumulation_steps).backward()
             accumulated_loss += loss.detach().item() / cfg.accumulation_steps
             samples_seen += len(batch['motion_future'])
+            for name in batch.get('task', []):
+                task_samples[name] = task_samples.get(name, 0) + 1
             tasks = set(batch.get('task',[]))
             task = next(iter(tasks)) if len(tasks)==1 else 'mixed'
             current = task_metrics.setdefault(task,dict(count=0))
@@ -220,11 +253,12 @@ class Trainer:
                     key = modality+'_valid_fraction'
                     current[key] = current.get(key,0.)+float(batch[modality+'_mask'].float().mean())
             if microstep % cfg.accumulation_steps:
+                last_batch_end = time.monotonic()
                 continue
             self.scaler.unscale_(self.optimizer)
             group_norms = {name: float(torch.linalg.vector_norm(torch.stack([p.grad.float().norm() for p in module.parameters() if p.grad is not None])))
                            for name,module in [('expert',self.model.motion_generator),*self.model.condition_bridge.adapters.items()]
-                           if any(p.grad is not None for p in module.parameters())}
+                           if any(p.grad is not None for p in module.parameters())} if (self.step+1) % cfg.log_every == 0 else {}
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.max_grad_norm,
                                                        error_if_nonfinite=True)
             self.scaler.step(self.optimizer)
@@ -234,22 +268,49 @@ class Trainer:
             self.step += 1
             self.last_loss = accumulated_loss
             if self.step % cfg.log_every == 0:
-                record = dict(step=self.step, loss=accumulated_loss,
-                    learning_rate=self.optimizer.param_groups[0]["lr"], grad_norm=float(grad_norm))
-                record['tasks'] = {task:{k:v/values['count'] for k,v in values.items() if k!='count'} for task,values in task_metrics.items()}
-                record['gradient_norms'] = group_norms
-                print(json.dumps(record), flush=True)
-                with (out / "metrics.jsonl").open("a") as f:
-                    f.write(json.dumps(record) + "\n")
+                payload = dict(loss=accumulated_loss, tasks=task_metrics, samples=task_samples,
+                               samples_seen=samples_seen, data_wait_seconds=data_wait_seconds,
+                               peak_memory=torch.cuda.max_memory_allocated(self.device) if self.device.type=='cuda' else 0,
+                               reserved_memory=torch.cuda.memory_reserved(self.device) if self.device.type=='cuda' else 0)
+                summaries = [payload]
+                if self.world_size > 1:
+                    summaries = [None] * self.world_size
+                    dist.all_gather_object(summaries, payload)
+                if self.rank == 0:
+                    combined_tasks, combined_samples = {}, {}
+                    for summary in summaries:
+                        for name, count in summary['samples'].items():
+                            combined_samples[name] = combined_samples.get(name, 0) + count
+                        for task, values in summary['tasks'].items():
+                            target = combined_tasks.setdefault(task, {})
+                            for key, value in values.items():
+                                target[key] = target.get(key, 0.) + value
+                    record = dict(step=self.step, loss=sum(s['loss'] for s in summaries)/self.world_size,
+                        learning_rate=self.optimizer.param_groups[0]['lr'], grad_norm=float(grad_norm),
+                        gradient_norms=group_norms, task_samples=combined_samples,
+                        elapsed_seconds=time.monotonic()-started,
+                        data_wait_seconds=[s['data_wait_seconds'] for s in summaries],
+                        samples_per_second=sum(s['samples_seen'] for s in summaries)/(time.monotonic()-started),
+                        rank_peak_memory_gib=[s['peak_memory']/2**30 for s in summaries],
+                        rank_reserved_memory_gib=[s['reserved_memory']/2**30 for s in summaries],
+                        tasks={task:{k:v/values['count'] for k,v in values.items() if k!='count'}
+                               for task,values in combined_tasks.items()})
+                    print(json.dumps(record), flush=True)
+                    with (out/'metrics.jsonl').open('a') as f:
+                        f.write(json.dumps(record)+'\n')
                 task_metrics = {}
             accumulated_loss = 0.0
-            if cfg.validation_every > 0 and self.step % cfg.validation_every == 0:
+            if self.rank == 0 and cfg.validation_every > 0 and self.step % cfg.validation_every == 0:
                 validation = self.validate()
                 if validation:
                     with (out/'validation.jsonl').open('a') as f:
                         f.write(json.dumps(dict(step=self.step,tasks=validation))+'\n')
-            if self.step % cfg.checkpoint_every == 0 or self.step == cfg.steps:
+            if self.rank == 0 and (self.step % cfg.checkpoint_every == 0 or self.step == cfg.steps):
                 save_checkpoint(out / "last.pt", self)
+            if self.world_size > 1 and (self.step % cfg.checkpoint_every == 0 or
+                    (cfg.validation_every > 0 and self.step % cfg.validation_every == 0) or self.step == cfg.steps):
+                dist.barrier()
+            last_batch_end = time.monotonic()
         for handle in handles:
             handle.remove()
         if self.device.type=='cuda':
@@ -258,8 +319,17 @@ class Trainer:
         self.profile = dict(elapsed_seconds=elapsed,optimizer_steps=self.step,
             executed_steps=self.step-starting_step,
             samples_per_second=samples_seen/max(elapsed,1e-9),
+            task_samples=task_samples,
             trainable_parameters=sum(p.numel() for p in self.model.parameters() if p.requires_grad),
             total_parameters=sum(p.numel() for p in self.model.parameters()),
             peak_gpu_memory_bytes=torch.cuda.max_memory_allocated(self.device) if self.device.type=='cuda' else None)
-        (out/'profile.json').write_text(json.dumps(self.profile,indent=2))
+        profiles = [self.profile]
+        if self.world_size > 1:
+            profiles = [None] * self.world_size
+            dist.all_gather_object(profiles, self.profile)
+        if self.rank == 0:
+            self.profile['world_size'] = self.world_size
+            self.profile['global_samples_per_second'] = sum(p['samples_per_second'] for p in profiles)
+            self.profile['rank_peak_gpu_memory_bytes'] = [p['peak_gpu_memory_bytes'] for p in profiles]
+            (out/'profile.json').write_text(json.dumps(self.profile, indent=2))
         return self.last_loss

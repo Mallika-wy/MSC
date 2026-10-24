@@ -13,7 +13,7 @@ the current dataset backend reads MSC Releases.
 | `motion/codec.py`, `motion/kinematics.py` | `src/omg/motion/feature_codec.py`, `src/omg/robots/g1/kinematics.py` | Preserve joint/link order, canonicalization, rot6d conventions, pure Torch FK; resolve packaged assets. |
 | `models/representation.py` | `src/omg/motion/representation.py` | Minimal normalization with persistent mean/std and statistics identity. |
 | `models/flow_matching.py` | `src/omg/generation/flow_matching/process.py` | Uniform linear flow, masked FP32 loss, Euler sampling and CFG; RTC remains opt-in. |
-| Text/audio conditioning | OMG `conditions/t5.py` and `models/motion_generator.py` | Local-only optional T5, independent adapters, frozen-token cache, explicit masks. |
+| Text/audio conditioning | OMG `conditions/t5.py` and `models/motion_generator.py` | Frozen online T5, offline audio features, independent adapters and explicit masks. |
 | `assets/` | OMG `assets/stats/g1_125d_stats.json`, G1 kinematics JSON and URDF | Small required assets packaged with MSC; no meshes or runtime simulators. |
 
 OMG copyright: Copyright (c) 2026 MARS Lab, Tsinghua University and contributors.
@@ -46,6 +46,8 @@ copied from the vendored GMR G1 assets because the upstream repository stores
 them via Git LFS. The offline Python runner uses the official model and ports
 only its G1 observation, motor mapping, and control loop; it does not require
 the upstream ROS/DDS/TensorRT deployment stack.
+Only the upstream policy constants header and main control-loop source are kept
+as C++ references; deployment builds, transports and deployment tests are omitted.
 
 The vendored GMR IK calls pass `damping`, `safety_break`, and `limits` explicitly
 for compatibility with the installed Mink API, reusing the existing joint limits.

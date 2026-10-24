@@ -20,6 +20,7 @@ class FlowMatching:
             times = torch.rand(data.shape[0], device=data.device)
         if times.shape not in {(data.shape[0],), data.shape[:2]}:
             raise ValueError("times must have shape [B] or [B,30]")
+        scalar_time = times.ndim == 1 and not rtc_training
         if times.ndim == 1:
             times = times[:, None].expand(-1, data.shape[1])
         if not torch.isfinite(times).all() or not ((times >= 0) & (times <= 1)).all():
@@ -45,7 +46,8 @@ class FlowMatching:
         t = times[..., None]
         x = ((1 - t) * data + t * noise).masked_fill(~mask[..., None], 0)
         target = noise - data
-        velocity = generator(x, times * self.time_scale, conditions, mask)
+        generator_times = times[:, 0] if scalar_time else times
+        velocity = generator(x, generator_times * self.time_scale, conditions, mask)
         error = (velocity.float() - target).square().mean(-1).masked_fill(~loss_mask, 0)
         if not loss_mask.any(-1).all():
             raise ValueError("Cannot compute loss on an empty motion")

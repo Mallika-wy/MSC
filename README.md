@@ -1,128 +1,76 @@
-# MSC: shared trimodal flow action expert
+# MSC v3 — Conditional Flow Motion Transformer
 
-MSC v2 generates canonical G1 motion with a shared action expert conditioned on
-frozen T5, MERT and V-JEPA features. Motion remains **canonical G1 125D, 30 FPS, 5 history
-frames and 30 future frames**. Encoders are frozen; the trainable model consists
-of independent modality adapters, a history adapter and six shared action blocks.
+MSC uses one shared **296.9M trainable-parameter** Flow Motion Expert for
+Text→Motion, Audio→Motion and feature-level Video→Motion. Motion is fixed to
+**G1 Canonical 125D, 30 FPS, 5 history frames and 30 future frames**.
+Each sample uses one external modality; a batch can mix tasks.
 
-Training reads published MSC Releases and offline features. It never writes to
-Data Pipeline inputs, work directories or Releases. Real V-JEPA features and
-three-task results are **Pending**.
+T5 stays frozen and encodes text online. Audio reads offline MERT features.
+Video is disabled until real V-JEPA metadata supplies its feature dimensions.
+The existing Motion Codec, normalization and published Releases are retained.
 
-Motion geometry and canonical conversion live in `msc.motion` (`codec`,
-`kinematics`, `rotations`); attention components live in `msc.models.attention`.
-The representation identifier is `g1_canonical_125d`. Only newly trained
-checkpoint format version 3 is supported; old checkpoints are not migrated.
-Source/license attribution is retained in `THIRD_PARTY.md`.
+- [Model architecture and parameter table](docs/msc_v3.md)
+- [Dataset pipeline and commands](docs/msc_dataset_v1.md)
+- [Release schema](docs/Release数据格式说明.md)
+- [OMG Text release](docs/OMG_Release数据格式说明.md)
+- [Source and license notices](THIRD_PARTY.md)
 
-Implementation, milestone acceptance, measured results and remaining prerequisites:
-[trimodal implementation report](docs/trimodal_implementation.md).
-Dataset and existing SONIC documentation: [MSC v1 dataset](docs/msc_dataset_v1.md).
+## Training
 
-## Environment checks
+The single training configuration is [msc_v3_2xa6000.yaml](configs/msc_v3_2xa6000.yaml):
+12 layers, hidden 1024, 16 heads, FFN 3072; two A6000 GPUs, BF16, batch **1152 per GPU**,
+global batch **2304**, no accumulation and **30,000 optimizer steps**.
+Sampling uses the existing shuffled window blocks without task-specific batches
+or a fixed task schedule. Stopping is step-based.
 
-```bash
-source .venv/bin/activate
-# For a new environment: pip install -e '.[data,text,test]'
-PYTHONPATH=src python -m pytest tests -q -m 'not integration'
-```
+Use Python >=3.10, PyTorch >=2.7 for the compiled dual-GPU setup, and install
+`pip install -e '.[text,data,test]'` in the selected environment. The local `.venv`
+is the default interpreter; set `MSC_PYTHON` to use another environment.
+The configuration requires four published Releases and local `model/t5-base-local`.
 
-The default real model has 6 blocks, width 512, 8 heads and FFN width 2048.
-`model.condition` configures the independent adapters and temporal attention bias.
-`model.losses` configures joint velocity/acceleration residual supervision.
-History stays valid in dropout and CFG null branches. Checkpoints use architecture
-`trimodal_flow_v2`, checkpoint version 3, and reject older weights.
-
-## Train from the published releases
-
-`configs/trimodal_release.yaml` lists the four published releases. Text is read
-from annotations and encoded online with frozen `model/t5-base-local`; audio
-uses the MERT features already bundled in each audio release. No T5 token cache
-is required. Pipeline work/cache directories are not training datasets.
-
-Published releases include `training/summary.json` and shared Arrow window
-indices per split. Dataset startup maps these directly and does not load the six
-metadata tables or repeat publication checks. Publication/validation builds or
-refreshes the index. To migrate existing releases and audit them together:
-
-```bash
-PYTHONPATH=src .venv/bin/python -m data_pipeline.cli index --dataset \
-  data/processed/omg-text/release \
-  data/processed/audio/aistpp/release \
-  data/processed/audio/finedance/release \
-  data/processed/audio/gdance/release
-```
-
-Rebuild after changing metadata, the selected label, or audio/video context
-lengths. Training requires a published index and never rebuilds it automatically.
+Compute dynamics statistics for the exact Train pool before starting:
 
 ```bash
 PYTHONPATH=src .venv/bin/python -m msc.data.stats \
-  --config configs/trimodal_release.yaml \
-  --output .runs/trimodal-dynamics-stats.json
+  --config configs/msc_v3_2xa6000.yaml --workers 8 \
+  --output .runs/msc-v3-dynamics-stats.json
 bash train.sh
 ```
 
-Set the release paths and local T5 path before running. Statistics use only the
-configured Train split and selected motion label. Recompute them when the data
-or selected window pools change. The statistics step reads motion windows but
-neither loads nor runs T5/MERT.
+Training reads only prebuilt Release indices and offline audio/video features.
+Outputs go to `.runs/msc-v3-epoch1-b1152`; only rank 0 saves and validates.
+Changing the Train pool requires recomputing matching statistics.
+Runtime outputs and statistics are local generated files, not included in the repository.
+See [dual A6000 setup and measured performance](docs/msc_v3_2xa6000.md).
 
-Training shuffles and traverses every eligible window once per epoch, without
-task weights or replacement. Shuffling uses bounded blocks to avoid a full
-permutation of the large OMG index, and checkpoints resume at the exact next
-batch. The incomplete final batch of an epoch is kept. `train.steps` remains the
-optimizer-step limit, so a run can stop partway through an epoch. `data.tasks`
-selects available condition types only; it does not set sampling probabilities.
-
-Text/audio batches can be mixed. Missing conditions have false masks; only
-present conditions influence the model. Per-condition validation remains
-available for comparing text and audio behavior.
-
-## Controlled short experiments
+## Tests and parameter audit
 
 ```bash
-PYTHONPATH=src python -m msc.training.experiments \
-  --config configs/trimodal_audio_overfit.yaml \
-  --output .runs/trimodal-audio-short \
-  --sonic-config configs/data_pipeline/aistpp_motion.yaml
+PYTHONPATH=src .venv/bin/python -m pytest tests data_pipeline/tests -q
+MSC_TEST_T5_PATH=model/t5-base-local PYTHONPATH=src .venv/bin/python \
+  -m pytest tests -q -m integration
+PYTHONPATH=src .venv/bin/python -m msc.models.audit
 ```
 
-The runner performs 200 GPU optimizer steps per available task. When real train
-and validation pools are available, it runs three 1000-step arms: FM, FM+velocity,
-and FM+velocity+acceleration. The latter two enable auxiliary supervision after
-100 optimizer steps. Arms share initialization, task/window sequence, flow noise,
-tau and evaluation seeds; the report records initialization and sampler hashes.
-CPU-only runs report the full experiment as Pending.
+CUDA, real T5 and simulator integration tests skip when their required environment
+is unavailable. Synthetic video checks validate the feature interface, not real video quality.
 
-AIST++ and FineDance now contain song-disjoint Train/Val/Test splits; independent validation comparisons
-remain Pending. Previous training outputs have been removed. Train fresh checkpoints
-with the current native implementation before sampling or evaluation.
-
-## Sampling and evaluation
-
-An Audio input `.pt` contains `tokens [B,L,768]`, `times [B,L]`, `mask [B,L]`
-and `metadata` matching checkpoint audio provenance. Text is supplied as a raw
-caption with `--text`; Video inputs contain `tokens [B,L,K,D]`, `intervals
-[B,L,2]`, `mask [B,L,K]`, and checkpoint feature `metadata`. Times are relative
-to the future window start. Use `--t5-path` to override the checkpoint's local T5
-directory for online frozen text encoding.
+## Sampling, RTC and evaluation
 
 ```bash
-PYTHONPATH=src python -m msc.sample --checkpoint /path/to/last.pt \
-  --history /path/to/history.pt --audio /path/to/audio.pt \
-  --device cuda:1 --output .runs/trimodal-sample.pt
-PYTHONPATH=src python -m msc.execute --sample .runs/trimodal-sample.pt \
-  --initial-state /path/to/anchor-qpos36.npz \
-  --config configs/data_pipeline/aistpp_motion.yaml --output .runs/trimodal-execution
-PYTHONPATH=src python -m msc.evaluate --checkpoint /path/to/last.pt \
-  --split val --device cuda:1 --output .runs/trimodal-evaluation \
-  --sonic-config configs/data_pipeline/aistpp_motion.yaml --rollout-chunks 3
+PYTHONPATH=src .venv/bin/python -m msc.sample --checkpoint /path/to/last.pt \
+  --history /path/to/history.pt --text 'walk forward' \
+  --device cuda:0 --output .runs/sample.pt
+PYTHONPATH=src .venv/bin/python -m msc.evaluate --checkpoint /path/to/last.pt \
+  --split val --device cuda:0 --output .runs/msc-v3-evaluation
 ```
 
-Evaluation records per-task losses, physical dynamic residuals, motion amplitudes,
-root motion, FK MPJPE, Jerk, chunk boundaries and matched/shuffled/missing-condition
-controls. Continuous rollouts re-anchor generated history and can run the existing
-SONIC tracker. Condition sensitivity alone does not establish semantic alignment.
+History is `[B,5,125]`. Audio feature inputs contain `tokens [B,L,768]`, `mask`,
+`times` and matching encoder metadata. Video inputs contain `tokens [B,L,K,D]`,
+`mask [B,L,K]`, `intervals [B,L,2]` and verified metadata. Media times are relative
+to future start after the Release TimeMap mapping. Video K/D are never guessed.
 
-Third-party source attribution and licensing is documented in [THIRD_PARTY.md](THIRD_PARTY.md).
+RTC is opt-in through `model.rtc=true`. Sampling supports `--rtc-mode train`
+for an RTC-trained model and `--rtc-mode test_time` for VJP guidance; both use
+`--previous-motion` and `--rtc-delay`. CFG uses `--cfg-scale` and retains history.
+Real video training and full-trajectory quality evaluation remain pending.

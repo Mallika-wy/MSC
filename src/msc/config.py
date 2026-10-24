@@ -6,8 +6,8 @@ import yaml
 
 @dataclass
 class ModelConfig:
-    hidden_dim: int = 512
-    num_layers: int = 6
+    hidden_dim: int = 1024
+    num_layers: int = 12
     ffn_dim: int | None = None
     representation: str = 'g1_canonical_125d'
     fps: int = 30
@@ -16,7 +16,7 @@ class ModelConfig:
     condition: dict = field(default_factory=dict)
     losses: dict = field(default_factory=lambda: dict(joint_velocity=.05,joint_acceleration=.01,dynamic_warmup_steps=1000))
     dynamic_stats_path: str | None = None
-    num_heads: int = 8
+    num_heads: int = 16
     dropout: float = 0.1
     text_dim: int = 768
     use_text: bool = True
@@ -54,6 +54,8 @@ class DataConfig:
 class TrainConfig:
     seed: int = 42
     deterministic: bool = True
+    compile_expert: bool = False
+    bf16_gradient_reduce: bool = False
     device: str = "cpu"
     precision: str = "fp32"
     steps: int = 10
@@ -98,7 +100,7 @@ class Config:
             raise ValueError('Unknown alignment policy')
         if d.cache_bytes < 0 or min(d.audio_context_sec,d.video_context_sec) < 0:
             raise ValueError('Cache/context must be nonnegative')
-        if not d.tasks or len(d.tasks)!=len(set(d.tasks)) or set(d.tasks)-{'text','audio','video','motion_only'}:
+        if not d.tasks or len(d.tasks)!=len(set(d.tasks)) or set(d.tasks)-{'text','audio','video'}:
             raise ValueError('Invalid data tasks')
         if m.condition.get('temporal_bias','relative_distance') not in {'none','relative_distance'}:
             raise ValueError('Unknown temporal bias')
@@ -118,9 +120,9 @@ class Config:
                 raise ValueError(f'{name} task is sampled but its adapter is disabled')
         if m.condition.get('audio',{}).get('dim',768) != 768:
             raise ValueError('Audio dimension must be 768 for MERT')
-        if any(m.losses.get(k,0) != 0 for k in ('foot_contact','root_dynamics','fk_consistency')) or m.losses.get('flow',1.) != 1.:
+        if m.losses.get('flow',1.) != 1.:
             raise ValueError('Only unchanged FM plus joint dynamics losses are supported')
-        if set(m.losses)-{'flow','joint_velocity','joint_acceleration','dynamic_normalization','dynamic_warmup_steps','foot_contact','root_dynamics','fk_consistency'}:
+        if set(m.losses)-{'flow','joint_velocity','joint_acceleration','dynamic_normalization','dynamic_warmup_steps'}:
             raise ValueError('Unknown loss configuration key')
         if any(not math.isfinite(m.losses.get(k,0)) or m.losses.get(k,0)<0 for k in ('joint_velocity','joint_acceleration','dynamic_warmup_steps')):
             raise ValueError('Loss weights/warmup must be nonnegative')

@@ -75,6 +75,7 @@ class ReleaseDataset(Dataset):
         self.tasks = tasks if tasks is not None else ['text','audio']
         self.contexts = dict(audio=audio_context_sec, video=video_context_sec)
         self.cache_bytes, self.cache, self.codec = cache_bytes, None, None
+        self.window_reader = None
         self._lookup, self.external_roots = [], []
         tables, identities, features = [], [], []
         for ri, root in enumerate(self.roots):
@@ -174,6 +175,35 @@ class ReleaseDataset(Dataset):
         ri, m, task, k, condition = self.window_identity(index)
         return self._read_window(ri,m,task,k,condition)
 
+    def __getitems__(self, indices):
+        """PyTorch DataLoader's batch hook: one batched FK/Codec call per batch."""
+        from .window_reader import MotionWindowReader
+        windows = [self.window_identity(index) for index in indices]
+        self._init_codec()
+        if self.window_reader is None:
+            self.window_reader = MotionWindowReader(self.roots, self.cache)
+        qpos = torch.from_numpy(self.window_reader.read(windows))
+        body_pos = self.codec.kinematics.forward_body_positions(qpos)
+        history, anchor_pos, anchor_quat = self.codec.prev_state_features_from_history(
+            qpos[:, :5], body_pos[:, :5], None, 30.)
+        future = self.codec.assemble_features(self.codec.canonicalize(
+            qpos[:, 5:], body_pos[:, 5:], None, anchor_pos, anchor_quat, 30.))
+        samples = []
+        for i, (ri, motion, task, frame, condition) in enumerate(windows):
+            sample = dict(motion_history=history[i], motion_future=future[i],
+                          motion_mask=torch.ones(30, dtype=torch.bool), task=task,
+                          window_id=f'{ri}:{motion.motion_id}:{motion.actor_id}:{motion.label_type}:{frame}',
+                          anchor_qpos=qpos[i, 4].clone())
+            self._condition(sample, ri, task, frame, condition)
+            samples.append(sample)
+        return samples
+
+    def _init_codec(self):
+        if self.cache is None:
+            self.cache = ByteCache(self.cache_bytes)
+            self.codec = G1MotionFeatureCodec(G1Kinematics(), num_prev_states=5,
+                                             canonical_frame_idx=4, rotation_representation='rot6d')
+
     def read_window(self,release_index,motion_id,task,k):
         """Explicit deterministic evaluation query, independent of sparse train subsets."""
         for ri,m,t,start,end,condition in self.motion_spans(release_index,motion_id,task):
@@ -190,9 +220,7 @@ class ReleaseDataset(Dataset):
 
     def _read_window(self,ri,m,task,k,condition):
         root = self.roots[ri]
-        if self.cache is None:
-            self.cache = ByteCache(self.cache_bytes)
-            self.codec = G1MotionFeatureCodec(G1Kinematics(), num_prev_states=5, canonical_frame_idx=4, rotation_representation='rot6d')
+        self._init_codec()
         window = replace(m, row_start=m.row_start+k-5, num_frames=35)
         qpos, times = self.cache.get(('motion',ri,m.motion_id,k), lambda: read_motion(root, window))
         qpos = torch.from_numpy(qpos.copy())[None]
@@ -203,6 +231,11 @@ class ReleaseDataset(Dataset):
                       motion_mask=torch.ones(30,dtype=torch.bool), task=task,
                       window_id=f'{ri}:{m.motion_id}:{m.actor_id}:{m.label_type}:{k}',
                       anchor_qpos=qpos[0,4].clone())
+        self._condition(sample, ri, task, k, condition)
+        return sample
+
+    def _condition(self, sample, ri, task, k, condition):
+        root = self.roots[ri]
         if task == 'text':
             sample['text'] = condition[2]
         elif task in ('audio','video'):
@@ -214,4 +247,3 @@ class ReleaseDataset(Dataset):
             sample[task+'_tokens'] = tokens
             sample[task+'_mask'] = torch.ones(tokens.shape[:-1],dtype=torch.bool)
             sample[task+('_times' if task=='audio' else '_intervals')] = torch.tensor(local,dtype=torch.float32)
-        return sample
