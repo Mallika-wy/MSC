@@ -20,7 +20,8 @@ class MotionWindowReader:
         offsets = np.r_[0, np.cumsum([file.metadata.row_group(i).num_rows
                                      for i in range(file.num_row_groups)])]
         self.files[key] = (file, offsets)
-        if len(self.files) > 16:
+        # A small fixed motion subset can still span many release shards.
+        if len(self.files) > 128:
             _, (old, _) = self.files.popitem(last=False)
             old.close()
         return file, offsets

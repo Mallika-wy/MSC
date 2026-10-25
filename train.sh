@@ -7,8 +7,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # ---------- Python 与 GPU ----------
 PYTHON="${MSC_PYTHON:-.venv/bin/python}"
-CONFIG="${MSC_CONFIG:-configs/msc_v3_2xa6000.yaml}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+CONFIG="${MSC_CONFIG:-configs/msc_v3_2xa6000.yaml}" # 共享模型配置；GPU 数量由下面的设置决定
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
 IFS=',' read -r -a GPU_LIST <<< "$CUDA_VISIBLE_DEVICES"
 NUM_GPUS="${NUM_GPUS:-${#GPU_LIST[@]}}"
 MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
@@ -16,10 +16,10 @@ MASTER_PORT="${MASTER_PORT:-29563}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda:0}"
 
 # ---------- 输出、训练长度与优化器 ----------
-OUTPUT_DIR="${OUTPUT_DIR:-.runs/msc-v1-2xa6000-b1152-text-audio}"         # 输出目录
+OUTPUT_DIR="${OUTPUT_DIR:-.runs/msc-v3-flow-only-1xa6000-b1152}"          # 输出目录
 RESUME="${RESUME:-null}"                                                  # null 或 checkpoint 路径
 SEED="${SEED:-42}"
-STEPS="${STEPS:-30000}"                         # optimizer steps
+STEPS="${STEPS:-60000}"                         # optimizer steps
 BATCH_SIZE="${BATCH_SIZE:-1152}"                 # 每卡 microbatch
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-0.0001}"
@@ -36,11 +36,11 @@ NUM_THREADS="${NUM_THREADS:-4}"
 
 # ---------- 日志、验证与保存 ----------
 LOG_EVERY="${LOG_EVERY:-10}"
-CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5000}"      # 保存 checkpoints/step_XXX.pt，保留历次文件
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-10000}"      # 保存 checkpoints/step_XXX.pt，保留历次文件
 VALIDATION_EVERY="${VALIDATION_EVERY:-2000}"       # 0 关闭验证
 VALIDATION_BATCHES="${VALIDATION_BATCHES:-2}"
 VALIDATION_MOTIONS_PER_TASK="${VALIDATION_MOTIONS_PER_TASK:-128}" # null 表示不限制
-WANDB_PROJECT="${WANDB_PROJECT:-msc-v1-2xa6000-b1152-text-audio}"          # null 关闭；启用时始终 offline
+WANDB_PROJECT="${WANDB_PROJECT:-msc-v3-flow-only}"                       # null 关闭；启用时始终 offline
 WANDB_NAME="${WANDB_NAME:-null}"                 # null 使用输出目录名称
 
 # ---------- 数据：列表使用 YAML 格式；修改训练池后重新运行 --stats ----------
@@ -85,8 +85,8 @@ MAX_DELAY="${MAX_DELAY:-8}"
 
 # ---------- 动力学辅助监督 ----------
 DYNAMICS_STATS_PATH="${DYNAMICS_STATS_PATH:-.runs/msc-v3-dynamics-stats.json}"
-JOINT_VELOCITY_WEIGHT="${JOINT_VELOCITY_WEIGHT:-0.05}"
-JOINT_ACCELERATION_WEIGHT="${JOINT_ACCELERATION_WEIGHT:-0.01}"
+JOINT_VELOCITY_WEIGHT="${JOINT_VELOCITY_WEIGHT:-0.0}"
+JOINT_ACCELERATION_WEIGHT="${JOINT_ACCELERATION_WEIGHT:-0.0}"
 DYNAMIC_WARMUP_STEPS="${DYNAMIC_WARMUP_STEPS:-1000}"
 
 # ---------- 通信、编译与显存分配 ----------
@@ -167,6 +167,7 @@ fi
 
 if [[ "${1:-}" == --stats ]]; then
   shift
+  printf '[MSC] Computing Train dynamics statistics with %s workers.\n' "$STATS_WORKERS"
   # 解析最后的命令行覆盖，确保输出路径与最终训练配置一致。
   STATS_OUTPUT=$("$PYTHON" -c \
     'import sys; from msc.config import load_config; print(load_config(sys.argv[1], sys.argv[2:]).model.dynamic_stats_path)' \
@@ -175,7 +176,14 @@ if [[ "${1:-}" == --stats ]]; then
     --workers "$STATS_WORKERS" --output "$STATS_OUTPUT" "${OVERRIDES[@]}" "$@"
 fi
 
-exec "$PYTHON" -m torch.distributed.run \
+printf '[MSC] Python: %s\n[MSC] Config: %s\n[MSC] GPUs: %s; processes: %s\n[MSC] Loading PyTorch and training modules...\n' \
+  "$PYTHON" "$CONFIG" "$CUDA_VISIBLE_DEVICES" "$NUM_GPUS"
+
+if (( NUM_GPUS == 1 )); then
+  exec "$PYTHON" -u -m msc.train --config "$CONFIG" "${OVERRIDES[@]}" "$@"
+fi
+
+exec "$PYTHON" -u -m torch.distributed.run \
   --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
   --nproc_per_node="$NUM_GPUS" -m msc.train --config "$CONFIG" \
   "${OVERRIDES[@]}" "$@"

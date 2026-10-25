@@ -244,7 +244,9 @@ MSC 当前离线保存 MERT 特征，T5 在训练时在线编码；训练读取�
 
 ## 训练数据遍历与缓存边界
 
-`train.sh` 使用本地冻结 T5 在线编码。四个 release 通过 `data.roots` 统一读取；`data.tasks: [text, audio]` 仅选择条件类型，不分配 task 权重。训练按有效窗口无放回遍历，每轮重新打乱块顺序及块内顺序，末尾不完整 batch 保留，支持断点精确继续；总更新数仍受 `train.steps` 限制。不同数据集/模态的出现频率由其有效窗口数量决定。每块最多 65,536 个索引，避免一次构建全量 OMG 的随机排列。
+`train.sh` 使用本地冻结 T5 在线编码。四个 release 通过 `data.roots` 统一读取；`data.tasks: [text, audio]` 仅选择条件类型，不分配 task 权重。训练默认采用 OMG `DistributedPermutationSampler` 的全局伪随机排列算法（SplitMix64、4 轮 Feistel 与 cycle-walking），覆盖全部有效窗口，每轮无放回遍历，不再按块打乱。排列由 seed 与轮次决定，按需计算索引，无需保存全量排列；支持直接从 batch 偏移续训。单卡末尾不完整 batch 保留；多卡为保证每个 rank 的 batch 等长，仅对末尾不足的全局 batch 重复填充。总更新数仍受 `train.steps` 限制。采样单位为窗口，数据集/模态的出现频率由有效窗口数量决定，不是按动作等概率。
+
+`train.sh` 与 `train_overfit.sh` 共用该默认采样器，无需额外开关。新的 checkpoint 元数据记录 `global_permutation` 及算法；此前完成的块式采样实验结果保持原样，不能将其描述为全局随机训练结果。全局伪随机排列是确定性的双射，不等于从所有可能排列中均匀抽取。全局读取可能降低 Parquet 缓存命中率，实际完整训练速度需另行测量。
 
 数据保存职责如下：release 中保存动作 qpos、原始文本、MERT 音频特征及必要索引；本地模型放在 model/；训练输出与统计放在 .runs/。尚未实现的帧级 FK 加速缓存可作为独立可重建派生物，不能代替 release。没有视频特征时不启用视频任务。
 

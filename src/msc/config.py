@@ -14,7 +14,7 @@ class ModelConfig:
     history_frames: int = 5
     future_frames: int = 30
     condition: dict = field(default_factory=dict)
-    losses: dict = field(default_factory=lambda: dict(joint_velocity=.05,joint_acceleration=.01,dynamic_warmup_steps=1000))
+    losses: dict = field(default_factory=lambda: dict(joint_velocity=0.,joint_acceleration=0.,dynamic_warmup_steps=1000))
     dynamic_stats_path: str | None = None
     num_heads: int = 16
     dropout: float = 0.1
@@ -48,6 +48,7 @@ class DataConfig:
     tasks: list[str] = field(default_factory=lambda: ['text','audio'])
     max_motions_per_task: int | None = None
     max_windows_per_motion: int | None = None
+    motion_manifest: str | None = None
 
 
 @dataclass

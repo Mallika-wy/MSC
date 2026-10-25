@@ -20,8 +20,9 @@ The existing Motion Codec, normalization and published Releases are retained.
 The base configuration is [msc_v3_2xa6000.yaml](configs/msc_v3_2xa6000.yaml):
 12 layers, hidden 1024, 16 heads, FFN 3072; two A6000 GPUs, BF16, batch **1152 per GPU**,
 global batch **2304**, no accumulation and **30,000 optimizer steps**.
-Sampling uses the existing shuffled window blocks without task-specific batches
-or a fixed task schedule. Stopping is step-based.
+Sampling uses OMG's global pseudorandom permutation of all windows, without
+replacement each epoch. No window blocks, task-specific batches or fixed task
+schedule are used. Stopping is step-based.
 
 Use Python >=3.10, PyTorch >=2.7 for the compiled dual-GPU setup, and install
 `pip install -e '.[text,data,test,tracking]'` in the selected environment. The local `.venv`
@@ -53,8 +54,12 @@ Learning rate warms up to `LEARNING_RATE` and then follows cosine decay to
 `MIN_LEARNING_RATE` (default `0.000001`). It stays at that floor after
 `SCHEDULE_STEPS`; the warmup can start below the decay floor.
 Each save writes `OUTPUT_DIR/checkpoints/step_XXX.pt`, retaining earlier steps.
-The launcher currently saves every 5000 optimizer steps and always saves the
+The launcher currently saves every 10000 optimizer steps and always saves the
 final step. Checkpoints contain model, optimizer, scheduler and RNG state.
+
+Joint velocity and acceleration auxiliary losses default to zero; training uses
+only Flow Loss. Set `JOINT_VELOCITY_WEIGHT` and `JOINT_ACCELERATION_WEIGHT` to
+enable them for a separate experiment.
 
 ```bash
 BATCH_SIZE=512 LEARNING_RATE=0.00005 STEPS=2000 WARMUP_STEPS=100 \
@@ -66,6 +71,13 @@ required. Only rank 0 writes a run under the output directory's `wandb/` folder.
 Training, per-task losses, learning rate, gradients, throughput, per-rank memory
 and validation metrics use optimizer steps as the chart axis. Configuration and
 the final profile are also saved. Code and model weights are not uploaded.
+`loss` averages optimizer-step losses over the latest logging interval;
+`step_loss` preserves the last optimizer step's loss. Both include gradient
+accumulation and are averaged across ranks.
+Logs expose `seconds_per_step`, `interval_samples_per_second` and `eta_hours`
+for the latest logging interval. `samples_per_second` remains the cumulative
+average. The first interval includes compilation; later intervals also account
+for any validation or checkpoint time since the previous log.
 Use `train.wandb_name=my-run` to name a run or `train.wandb_project=null` to disable it:
 
 ```bash
@@ -86,6 +98,20 @@ is unavailable. Synthetic video checks validate the feature interface, not real 
 
 ## Sampling, RTC and evaluation
 
+For **complete motions**, use the seeded 10-motion evaluator:
+
+```bash
+CHECKPOINT=/path/to/checkpoints/step_10000.pt SEED=42 RTC=true \
+  OUTPUT_DIR=.runs/full-eval-rtc bash eval.sh
+```
+
+It inherits the checkpoint dataset/subset; set `DATA_ROOT` and optionally
+`MOTION_MANIFEST` to choose another dataset. `RTC=false` disables test-time RTC.
+Output videos preserve every GT frame, including the five initialization frames,
+and display the full text caption below the robot panels. `FEEDBACK=sonic` uses
+persistent physical execution feedback; the default uses generated motion history.
+See [full-motion evaluation](docs/full_motion_eval.md) for parameters and outputs.
+
 ```bash
 PYTHONPATH=src .venv/bin/python -m msc.sample --checkpoint /path/to/checkpoints/step_30000.pt \
   --history /path/to/history.pt --text 'walk forward' \
@@ -99,7 +125,8 @@ History is `[B,5,125]`. Audio feature inputs contain `tokens [B,L,768]`, `mask`,
 `mask [B,L,K]`, `intervals [B,L,2]` and verified metadata. Media times are relative
 to future start after the Release TimeMap mapping. Video K/D are never guessed.
 
-RTC is opt-in through `model.rtc=true`. Sampling supports `--rtc-mode train`
+RTC training is opt-in through `model.rtc=true`. Sampling supports `--rtc-mode train`
 for an RTC-trained model and `--rtc-mode test_time` for VJP guidance; both use
 `--previous-motion` and `--rtc-delay`. CFG uses `--cfg-scale` and retains history.
-Real video training and full-trajectory quality evaluation remain pending.
+Real video training remains pending; numerical motion metrics alone do not
+establish semantic correctness or held-out generation quality.

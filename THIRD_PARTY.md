@@ -16,6 +16,12 @@ the current dataset backend reads MSC Releases.
 | Text/audio conditioning | OMG `conditions/t5.py` and `models/motion_generator.py` | Frozen online T5, offline audio features, independent adapters and explicit masks. |
 | `assets/` | OMG `assets/stats/g1_125d_stats.json`, G1 kinematics JSON and URDF | Small required assets packaged with MSC; no meshes or runtime simulators. |
 
+`training/sampling.py` additionally adapts `_splitmix64` and the four-round
+Feistel/cycle-walking permutation from OMG `src/omg/data/datamodule.py`
+(`DistributedPermutationSampler`), checkout `04edd4762ffe0f865b2ca39f38933ccc5f93a2eb`.
+MSC batches the global permutation before splitting across ranks and supports
+direct batch-offset resume; it does not use the materialized shard sampler.
+
 OMG copyright: Copyright (c) 2026 MARS Lab, Tsinghua University and contributors.
 The complete MIT notice is in `licenses/OMG-MIT.txt`.
 

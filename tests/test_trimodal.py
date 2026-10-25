@@ -284,6 +284,26 @@ def test_cache_budget_and_short_subset(release):
     assert len({data.window_identity(i)[1].motion_id for i in range(3)})==1
 
 
+def test_motion_manifest_selects_exact_caption_interval_and_survives_pickle(release, tmp_path):
+    import pickle
+    full = ReleaseDataset([release], tasks=['text'])
+    ri, motion, _, lo, hi, condition = full.spans[0]
+    end = min(hi, lo + 3)
+    manifest = tmp_path / 'selection.json'
+    manifest.write_text(json.dumps({'rows': [dict(release_index=ri, motion_id=motion.motion_id,
+        text=condition[2].strip(), start_frame=lo, end_frame_exclusive=end)]}))
+    selected = ReleaseDataset([release], tasks=['text'], motion_manifest=str(manifest))
+    assert len(selected) == end - lo
+    assert selected.identity != full.identity
+    restored = pickle.loads(pickle.dumps(selected))
+    assert restored.identity == selected.identity
+    for i in range(len(selected)):
+        assert restored.window_identity(i)[1].motion_id == motion.motion_id
+        assert restored.window_identity(i)[3] == lo + i
+        torch.testing.assert_close(restored[i]['motion_future'], selected[i]['motion_future'])
+        assert restored[i]['text'].strip() == condition[2].strip()
+
+
 def test_training_start_reads_only_prebuilt_index(release, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError('Training startup must not read Inventory or Parquet metadata')

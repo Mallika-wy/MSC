@@ -47,7 +47,11 @@ def test_offline_wandb_records_training_and_validation(cfg, toy_dataset, tmp_pat
     assert runs[0].config['train']['batch_size'] == cfg.train.batch_size
     assert [record['optimizer_step'] for record in records] == [1, 1, 2, 2]
     assert 'train/loss' in records[0]
+    assert 'train/step_loss' in records[0]
     assert 'train/learning_rate' in records[0]
+    assert 'train/seconds_per_step' in records[0]
+    assert 'train/interval_samples_per_second' in records[0]
+    assert 'train/eta_hours' in records[0]
     assert 'train/gradient_norms/expert' in records[0]
     assert 'train/rank_peak_memory_gib/0' in records[0]
     assert records[1]['val/audio/loss_flow'] == .5

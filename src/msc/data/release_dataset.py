@@ -62,7 +62,7 @@ class ReleaseDataset(Dataset):
     def __init__(self, roots, *, split='train', label_policy='train_default',
                  alignment_policy='allow_estimated', tasks=None, audio_context_sec=.25,
                  video_context_sec=.25, cache_bytes=128 * 1024**2,
-                 max_motions_per_task=None, max_windows_per_motion=None):
+                 max_motions_per_task=None, max_windows_per_motion=None, motion_manifest=None):
         import pyarrow as pa
         import pyarrow.compute as pc
         from data_pipeline.release.training_index import VERSION
@@ -70,7 +70,8 @@ class ReleaseDataset(Dataset):
         self._settings = dict(roots=list(roots), split=split, label_policy=label_policy,
             alignment_policy=alignment_policy, tasks=tasks, audio_context_sec=audio_context_sec,
             video_context_sec=video_context_sec, cache_bytes=cache_bytes,
-            max_motions_per_task=max_motions_per_task, max_windows_per_motion=max_windows_per_motion)
+            max_motions_per_task=max_motions_per_task, max_windows_per_motion=max_windows_per_motion,
+            motion_manifest=motion_manifest)
         self.roots = [Path(p).resolve() for p in roots]
         self.tasks = tasks if tasks is not None else ['text','audio']
         self.contexts = dict(audio=audio_context_sec, video=video_context_sec)
@@ -102,6 +103,22 @@ class ReleaseDataset(Dataset):
                             for f in summary['features'] if f['asset_id'] in modalities
                             and modalities[f['asset_id']] in self.tasks)
         table = pa.concat_tables(tables)
+        selection = None
+        if motion_manifest is not None:
+            selection = json.loads(Path(motion_manifest).read_text())['rows']
+            chosen = {(r['release_index'], r['motion_id']): r for r in selection}
+            ids = pa.array([r['motion_id'] for r in selection], type=pa.string())
+            candidates = table.filter(pc.is_in(pc.cast(table['motion_id'], pa.string()), value_set=ids))
+            rows = []
+            for row in candidates.to_pylist():
+                item = chosen.get((row['release_index'], row['motion_id']))
+                if item is None or row['task'] != 'text' or row['text'].strip() != item['text']:
+                    continue
+                row['start'] = max(row['start'], item['start_frame'])
+                row['end'] = min(row['end'], item['end_frame_exclusive'])
+                if row['start'] < row['end']:
+                    rows.append(row)
+            table = pa.Table.from_pylist(rows, schema=table.schema)
         # Subsets select rows before constructing any Python Motion objects.
         if max_motions_per_task is not None:
             masks = []
@@ -151,7 +168,8 @@ class ReleaseDataset(Dataset):
         self.feature_metadata = dict(features=features, video_task='offline_demonstration')
         self.identity = fingerprint(dict(index_version=VERSION, releases=identities, split=split,
             tasks=self.tasks, alignment=alignment_policy, label=label_policy,
-            max_motions_per_task=max_motions_per_task, max_windows_per_motion=max_windows_per_motion))
+            max_motions_per_task=max_motions_per_task, max_windows_per_motion=max_windows_per_motion,
+            **({'motion_selection': selection} if selection is not None else {})))
 
     def __len__(self):
         return int(self.ends[-1]) if len(self.ends) else 0

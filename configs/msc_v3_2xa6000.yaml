@@ -29,8 +29,8 @@ model:
       dropout: 0.1
   losses:
     flow: 1.0
-    joint_velocity: 0.05
-    joint_acceleration: 0.01
+    joint_velocity: 0.0
+    joint_acceleration: 0.0
     dynamic_normalization: train_stats
     dynamic_warmup_steps: 1000
   dynamic_stats_path: .runs/msc-v3-dynamics-stats.json

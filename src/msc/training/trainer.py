@@ -10,62 +10,11 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from .distributed import RankBatchSampler, TrainingLoss
 from .tracking import flatten_metrics, offline_run
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 from msc.data.collator import collate_motion
 from msc.factory import to_device, build_dataset
 from .checkpoint import save_checkpoint, load_checkpoint, metadata, restore_rng
-from bisect import bisect_right
-
-
-class EpochBatchSampler(Sampler):
-    """Visit each window once per epoch; bounded block shuffling supports exact resume."""
-    block_size = 65536
-
-    def __init__(self, size, batch_size, start, stop, seed, ranges=None):
-        self.ranges = ranges
-        self.ends = []
-        for a,b in ranges or []:
-            self.ends.append((self.ends[-1] if self.ends else 0)+b-a)
-        self.size = self.ends[-1] if ranges else size
-        self.batch_size, self.start, self.stop, self.seed = batch_size,start,stop,seed
-        self.batches_per_epoch = math.ceil(self.size / batch_size)
-
-    def __iter__(self):
-        step = self.start
-        while step < self.stop:
-            epoch, batch_offset = divmod(step,self.batches_per_epoch)
-            skip = batch_offset*self.batch_size
-            blocks = math.ceil(self.size/self.block_size)
-            generator = torch.Generator().manual_seed(self.seed+epoch)
-            order = torch.randperm(blocks,generator=generator).tolist()
-            batch = []
-            for block in order:
-                first = block*self.block_size
-                length = min(self.block_size,self.size-first)
-                if skip >= length:
-                    skip -= length
-                    continue
-                generator = torch.Generator().manual_seed(self.seed+epoch*1000003+block*104729)
-                indices = torch.randperm(length,generator=generator).tolist()
-                for local in indices[skip:]:
-                    index = first+local
-                    if self.ranges:
-                        span = bisect_right(self.ends,index)
-                        index = self.ranges[span][0]+index-(self.ends[span-1] if span else 0)
-                    batch.append(index)
-                    if len(batch)==self.batch_size:
-                        yield batch
-                        step += 1
-                        if step >= self.stop:
-                            return
-                        batch = []
-                skip = 0
-            if batch:
-                yield batch
-                step += 1
-
-    def __len__(self):
-        return self.stop-self.start
+from .sampling import EpochBatchSampler
 
 
 def worker_init(worker_id):
@@ -212,8 +161,10 @@ class Trainer:
             torch.cuda.synchronize(self.device)
         started = time.monotonic()
         starting_step = self.step
+        last_log_time, last_log_step, last_log_samples = started, starting_step, 0
         self.optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
+        interval_loss, interval_steps = 0.0, 0
         samples_seen = 0
         task_metrics = {}
         task_samples = {}
@@ -276,8 +227,11 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             self.step += 1
             self.last_loss = accumulated_loss
+            interval_loss += accumulated_loss
+            interval_steps += 1
             if self.step % cfg.log_every == 0:
-                payload = dict(loss=accumulated_loss, tasks=task_metrics, samples=task_samples,
+                payload = dict(loss_sum=interval_loss, loss_steps=interval_steps, step_loss=accumulated_loss,
+                               tasks=task_metrics, samples=task_samples,
                                samples_seen=samples_seen, data_wait_seconds=data_wait_seconds,
                                peak_memory=torch.cuda.max_memory_allocated(self.device) if self.device.type=='cuda' else 0,
                                reserved_memory=torch.cuda.memory_reserved(self.device) if self.device.type=='cuda' else 0)
@@ -294,12 +248,21 @@ class Trainer:
                             target = combined_tasks.setdefault(task, {})
                             for key, value in values.items():
                                 target[key] = target.get(key, 0.) + value
-                    record = dict(step=self.step, loss=sum(s['loss'] for s in summaries)/self.world_size,
+                    now = time.monotonic()
+                    global_samples = sum(s['samples_seen'] for s in summaries)
+                    interval = now - last_log_time
+                    seconds_per_step = interval / (self.step - last_log_step)
+                    record = dict(step=self.step,
+                        loss=sum(s['loss_sum'] for s in summaries)/sum(s['loss_steps'] for s in summaries),
+                        step_loss=sum(s['step_loss'] for s in summaries)/self.world_size,
                         learning_rate=self.optimizer.param_groups[0]['lr'], grad_norm=float(grad_norm),
                         gradient_norms=group_norms, task_samples=combined_samples,
-                        elapsed_seconds=time.monotonic()-started,
+                        elapsed_seconds=now-started,
                         data_wait_seconds=[s['data_wait_seconds'] for s in summaries],
-                        samples_per_second=sum(s['samples_seen'] for s in summaries)/(time.monotonic()-started),
+                        samples_per_second=global_samples/(now-started),
+                        seconds_per_step=seconds_per_step,
+                        interval_samples_per_second=(global_samples-last_log_samples)/interval,
+                        eta_hours=(cfg.steps-self.step)*seconds_per_step/3600,
                         rank_peak_memory_gib=[s['peak_memory']/2**30 for s in summaries],
                         rank_reserved_memory_gib=[s['reserved_memory']/2**30 for s in summaries],
                         tasks={task:{k:v/values['count'] for k,v in values.items() if k!='count'}
@@ -309,7 +272,9 @@ class Trainer:
                         f.write(json.dumps(record)+'\n')
                     if run is not None:
                         run.log({'optimizer_step': self.step, **flatten_metrics(record, 'train')})
+                    last_log_time, last_log_step, last_log_samples = now, self.step, global_samples
                 task_metrics = {}
+                interval_loss, interval_steps = 0.0, 0
             accumulated_loss = 0.0
             if self.rank == 0 and cfg.validation_every > 0 and self.step % cfg.validation_every == 0:
                 validation = self.validate()
