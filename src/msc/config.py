@@ -45,6 +45,7 @@ class DataConfig:
     audio_context_sec: float = .25
     video_context_sec: float = .25
     cache_bytes: int = 134217728
+    cache_dir: str | None = None
     tasks: list[str] = field(default_factory=lambda: ['text','audio'])
     max_motions_per_task: int | None = None
     max_windows_per_motion: int | None = None
@@ -53,6 +54,9 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
+    sampling: str = 'global_permutation'
+    active_episodes: int = 64
+    windows_per_episode: int = 8
     seed: int = 42
     deterministic: bool = True
     compile_expert: bool = False
@@ -88,6 +92,10 @@ class Config:
 
     def validate(self):
         m, d, t = self.model, self.data, self.train
+        if t.sampling not in {'global_permutation', 'episode_interleaved'}:
+            raise ValueError('Unknown training sampling strategy')
+        if any(not isinstance(x, int) or x < 1 for x in (t.active_episodes, t.windows_per_episode)):
+            raise ValueError('Episode interleaving settings must be positive integers')
         if d.backend != "msc_release":
             raise ValueError("Unknown data backend")
         if m.condition.get('text',{}).get('enabled',m.use_text) and not m.t5_path:

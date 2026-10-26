@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from msc.data.collator import collate_motion
 from msc.factory import to_device, build_dataset
 from .checkpoint import save_checkpoint, load_checkpoint, metadata, restore_rng
-from .sampling import EpochBatchSampler
+from .sampling import EpochBatchSampler, InterleavedEpisodeBatchSampler
 
 
 def worker_init(worker_id):
@@ -29,6 +29,9 @@ def worker_init(worker_id):
 class Trainer:
     def __init__(self, model, dataset, config):
         self.config, self.dataset = config, dataset
+        stats_identity = model.representation.stats_dataset_identity
+        if stats_identity is not None and stats_identity != dataset.identity:
+            raise ValueError('Normalization statistics do not match selected Release dataset')
         cfg = config.train
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -146,8 +149,13 @@ class Trainer:
             out.mkdir(parents=True, exist_ok=True)
             (out / "config.json").write_text(json.dumps(self.config.to_dict(), indent=2))
             (out / "metadata.json").write_text(json.dumps(metadata(self.model, self.config, self.dataset), indent=2))
-        sampler = EpochBatchSampler(len(self.dataset), cfg.batch_size * self.world_size,
-            self.step * cfg.accumulation_steps, cfg.steps * cfg.accumulation_steps, cfg.seed)
+        if cfg.sampling == 'episode_interleaved':
+            sampler = InterleavedEpisodeBatchSampler(self.dataset.episode_ranges, cfg.batch_size * self.world_size,
+                self.step * cfg.accumulation_steps, cfg.steps * cfg.accumulation_steps, cfg.seed,
+                cfg.active_episodes, cfg.windows_per_episode)
+        else:
+            sampler = EpochBatchSampler(len(self.dataset), cfg.batch_size * self.world_size,
+                self.step * cfg.accumulation_steps, cfg.steps * cfg.accumulation_steps, cfg.seed)
         if self.world_size > 1:
             sampler = RankBatchSampler(sampler, self.rank, self.world_size, cfg.batch_size)
         loader = DataLoader(self.dataset, batch_sampler=sampler, collate_fn=collate_motion,

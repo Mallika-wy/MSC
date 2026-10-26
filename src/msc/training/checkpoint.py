@@ -27,8 +27,12 @@ def metadata(model, config, dataset=None):
                 architecture=model.architecture_version,features=model.feature_metadata,
                 dataset_identity=getattr(dataset,'identity',None),
                 dynamic_stats_sha256=model.dynamic_stats_sha256,
-                sampling=dict(version=4,mode='global_permutation',algorithm='splitmix64_feistel4',
-                              tasks=config.data.tasks,seed=config.train.seed),
+                sampling=(dict(version=5, mode='episode_interleaved', algorithm='splitmix64_feistel4',
+                               active_episodes=config.train.active_episodes, windows_per_episode=config.train.windows_per_episode,
+                               tasks=config.data.tasks, seed=config.train.seed)
+                          if config.train.sampling == 'episode_interleaved' else
+                          dict(version=4,mode='global_permutation',algorithm='splitmix64_feistel4',
+                               tasks=config.data.tasks,seed=config.train.seed)),
                 noise=dict(seed_offset=1000003,mode='per_microstep',rng='torch'),
                 losses=dict(version=1,config=model.loss_config),
                 flow=dict(type="linear_velocity", time_scale=1000.0, time_sampling="uniform", direction="1_to_0"))

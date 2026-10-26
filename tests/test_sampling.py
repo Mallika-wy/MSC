@@ -2,6 +2,38 @@ import pytest
 
 from msc.training.distributed import RankBatchSampler
 from msc.training.sampling import EpochBatchSampler
+from msc.training.sampling import InterleavedEpisodeBatchSampler
+
+
+def test_interleaving_covers_discontiguous_episode_ranges_each_epoch():
+    episodes = [[(0, 10), (20, 30)], [(10, 20)], [(30, 53)]]
+    batches = list(InterleavedEpisodeBatchSampler(episodes, 7, 0, 16, 42, 2, 3))
+    assert sorted(i for batch in batches[:8] for i in batch) == list(range(53))
+    assert sorted(i for batch in batches[8:] for i in batch) == list(range(53))
+    assert batches[:8] != batches[8:]
+
+
+def test_interleaving_64_episodes_take_8_then_rotate():
+    from collections import Counter
+    episodes = [[(i*1000, (i+1)*1000)] for i in range(100)]
+    batch = next(iter(InterleavedEpisodeBatchSampler(episodes, 2048, 0, 1, 42)))
+    counts = Counter(i//1000 for i in batch)
+    assert len(counts) == 64 and set(counts.values()) == {32}
+    for first in range(0, 2048, 8):
+        assert len({i//1000 for i in batch[first:first+8]}) == 1
+    assert len(set(batch)) == 2048
+
+
+@pytest.mark.parametrize('offset', [0, 1, 4, 7, 8, 9, 15])
+def test_interleaving_resume_and_ddp_tail_padding(offset):
+    episodes = [[(0, 11)], [(11, 37)], [(37, 53)]]
+    args = dict(episodes=episodes, batch_size=8, stop=18, seed=42, active_episodes=2, windows_per_episode=3)
+    expected = list(InterleavedEpisodeBatchSampler(start=0, **args))
+    assert list(InterleavedEpisodeBatchSampler(start=offset, **args)) == expected[offset:]
+    ranks = [list(RankBatchSampler(InterleavedEpisodeBatchSampler(start=0, **args), r, 2, 4)) for r in range(2)]
+    for batch, left, right in zip(expected, *ranks):
+        assert (left+right)[:len(batch)] == batch
+        assert set(left+right) == set(batch)
 
 
 @pytest.mark.parametrize('size', [*range(1, 34), 63, 64, 65, 255, 256, 257, 1023, 1024, 1025])

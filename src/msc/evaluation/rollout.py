@@ -50,7 +50,7 @@ def select_motions(dataset, count, seed):
     """Uniformly sample distinct motions, not windows weighted by clip length."""
     import pyarrow as pa
     import pyarrow.compute as pc
-    table = dataset.rollout_spans.table
+    table = dataset.rollout_spans.table.unify_dictionaries()
     grouped = table.group_by(['release_index', 'motion_id', 'task']).aggregate(
         [('start', 'min'), ('end', 'max'), ('num_frames', 'max')])
     coarse = pc.and_(pc.less_equal(grouped['start_min'], 5),

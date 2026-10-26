@@ -1,0 +1,80 @@
+# Dual A800 80GB profile; defaults mirror train_a800.sh / train.sh.
+model:
+  hidden_dim: 1024
+  num_layers: 12
+  num_heads: 16
+  ffn_dim: 3072
+  t5_path: model/t5-base-local
+  stats_path: .runs/msc-v3-normalization-stats.json
+  condition:
+    fusion: token_cross_attention
+    temporal_bias: relative_distance
+    history_dropout: 0.0
+    text:
+      enabled: true
+      backend: t5
+      frozen: true
+      dim: auto
+      dropout: 0.1
+    audio:
+      enabled: true
+      backend: mert_v1_95m
+      frozen: true
+      dim: 768
+      dropout: 0.1
+    video:
+      enabled: false
+      backend: vjepa
+      frozen: true
+      dim: auto
+      dropout: 0.1
+  losses:
+    flow: 1.0
+    joint_velocity: 0.0
+    joint_acceleration: 0.0
+    dynamic_normalization: train_stats
+    dynamic_warmup_steps: 1000
+  dynamic_stats_path: .runs/msc-v3-dynamics-stats.json
+  rtc: false
+data:
+  backend: msc_release
+  roots:
+  - data/processed/omg-text/release
+  - data/processed/audio/aistpp/release
+  - data/processed/audio/finedance/release
+  - data/processed/audio/gdance/release
+  split: train
+  label_policy: train_default
+  alignment_policy: allow_estimated
+  audio_context_sec: 0.25
+  video_context_sec: 0.25
+  cache_bytes: 536870912
+  cache_dir: .runs/data-cache
+  tasks:
+  - text
+  - audio
+  num_workers: 8
+train:
+  sampling: episode_interleaved
+  active_episodes: 64
+  windows_per_episode: 8
+  device: cuda:0
+  precision: bf16
+  batch_size: 2048
+  accumulation_steps: 1
+  learning_rate: 0.0001
+  min_learning_rate: 0.000001
+  warmup_steps: 1000
+  schedule_steps: 60000
+  steps: 60000
+  validation_every: 2000
+  validation_batches: 2
+  checkpoint_every: 10000
+  log_every: 10
+  output_dir: .runs/msc-v3-flow-only-2xa800-b2048
+  deterministic: false
+  num_threads: 4
+  validation_motions_per_task: 128
+  compile_expert: true
+  bf16_gradient_reduce: true
+  wandb_project: msc-v3-flow-only

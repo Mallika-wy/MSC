@@ -24,6 +24,12 @@ class MotionRepresentation(nn.Module):
         path = Path(stats_path) if stats_path else ASSETS / "stats/g1_125d_stats.json"
         content = path.read_bytes()
         stats = json.loads(content)
+        self.stats_dataset_identity = stats.get('dataset_identity')
+        if self.stats_dataset_identity is not None:
+            contract = (stats.get('split'), stats.get('representation'), stats.get('fps'),
+                        stats.get('num_prev_states'), stats.get('canonical_frame_idx'), stats.get('sequence_length'))
+            if contract != ('train', self.name, 30, 5, 4, 30):
+                raise ValueError('Normalization statistics do not match the MSC 5/30-frame Train contract')
         mean, std = [torch.tensor(stats[k], dtype=torch.float32) for k in ("mean", "std")]
         if mean.shape != (125,) or std.shape != (125,) or not torch.isfinite(mean).all() or not torch.isfinite(std).all():
             raise ValueError("Expected finite canonical G1 125D normalization statistics")

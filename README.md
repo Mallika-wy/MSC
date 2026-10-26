@@ -17,6 +17,12 @@ The existing Motion Codec, normalization and published Releases are retained.
 
 ## Training
 
+For the dual A800 80GB container profile, use `bash train_a800.sh`.
+It selects GPUs 0 and 1, the MSC-local OMG environment, array storage caches,
+and 64-episode / 8-window interleaved sampling. See
+[A800 setup and measurements](docs/msc_v3_2xa800.md) for environment setup,
+the measured batch size and run locations.
+
 The base configuration is [msc_v3_2xa6000.yaml](configs/msc_v3_2xa6000.yaml):
 12 layers, hidden 1024, 16 heads, FFN 3072; two A6000 GPUs, BF16, batch **1152 per GPU**,
 global batch **2304**, no accumulation and **30,000 optimizer steps**.

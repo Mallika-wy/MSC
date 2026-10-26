@@ -19,6 +19,9 @@ TRAIN_DEVICE="${TRAIN_DEVICE:-cuda:0}"
 OUTPUT_DIR="${OUTPUT_DIR:-.runs/msc-v3-flow-only-1xa6000-b1152}"          # 输出目录
 RESUME="${RESUME:-null}"                                                  # null 或 checkpoint 路径
 SEED="${SEED:-42}"
+SAMPLING="${SAMPLING:-global_permutation}"
+ACTIVE_EPISODES="${ACTIVE_EPISODES:-64}"
+WINDOWS_PER_EPISODE="${WINDOWS_PER_EPISODE:-8}"
 STEPS="${STEPS:-60000}"                         # optimizer steps
 BATCH_SIZE="${BATCH_SIZE:-1152}"                 # 每卡 microbatch
 ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-1}"
@@ -56,6 +59,8 @@ LABEL_POLICY="${LABEL_POLICY:-train_default}"
 ALIGNMENT_POLICY="${ALIGNMENT_POLICY:-allow_estimated}" # allow_estimated / verified_only
 NUM_WORKERS="${NUM_WORKERS:-8}"                  # 每卡 DataLoader workers
 CACHE_MB="${CACHE_MB:-512}"                      # 每个 worker 的缓存 MiB
+CACHE_DIR="${DATA_CACHE_DIR:-null}"              # 可选只读 NPY 数据缓存
+CACHE_WORKERS="${CACHE_WORKERS:-8}"
 AUDIO_CONTEXT_SEC="${AUDIO_CONTEXT_SEC:-0.25}"
 VIDEO_CONTEXT_SEC="${VIDEO_CONTEXT_SEC:-0.25}"
 MAX_MOTIONS_PER_TASK="${MAX_MOTIONS_PER_TASK:-null}"
@@ -106,6 +111,9 @@ OVERRIDES=(
   "train.output_dir=$OUTPUT_DIR"
   "train.resume=$RESUME"
   "train.seed=$SEED"
+  "train.sampling=$SAMPLING"
+  "train.active_episodes=$ACTIVE_EPISODES"
+  "train.windows_per_episode=$WINDOWS_PER_EPISODE"
   "train.steps=$STEPS"
   "train.batch_size=$BATCH_SIZE"
   "train.accumulation_steps=$ACCUMULATION_STEPS"
@@ -134,6 +142,7 @@ OVERRIDES=(
   "data.alignment_policy=$ALIGNMENT_POLICY"
   "data.num_workers=$NUM_WORKERS"
   "data.cache_bytes=$((CACHE_MB * 1024 * 1024))"
+  "data.cache_dir=$CACHE_DIR"
   "data.audio_context_sec=$AUDIO_CONTEXT_SEC"
   "data.video_context_sec=$VIDEO_CONTEXT_SEC"
   "data.max_motions_per_task=$MAX_MOTIONS_PER_TASK"
@@ -163,6 +172,30 @@ OVERRIDES=(
 )
 if [[ -n "$VIDEO_SPATIAL_TOKENS" ]]; then
   OVERRIDES+=("model.condition.video.spatial_tokens=$VIDEO_SPATIAL_TOKENS")
+fi
+
+if [[ "${1:-}" == --cache ]]; then
+  shift
+  CACHE_OUTPUT=$("$PYTHON" -c \
+    'import sys; from msc.config import load_config; c=load_config(sys.argv[1],sys.argv[2:]); print(c.data.cache_dir or ".runs/data-cache")' \
+    "$CONFIG" "${OVERRIDES[@]}" "$@")
+  exec "$PYTHON" -u -m msc.data.storage_cache --config "$CONFIG" \
+    --output "$CACHE_OUTPUT" --workers "$CACHE_WORKERS" "${OVERRIDES[@]}" "$@"
+fi
+
+if [[ "${1:-}" == --normalization-stats ]]; then
+  shift
+  STATS_OUTPUT=$("$PYTHON" -c \
+    'import sys; from msc.config import load_config; c=load_config(sys.argv[1],sys.argv[2:]); print(c.model.stats_path or ".runs/msc-v3-normalization-stats.json")' \
+    "$CONFIG" "${OVERRIDES[@]}" "$@")
+  if (( NUM_GPUS == 1 )); then
+    exec "$PYTHON" -u -m msc.data.normalization_stats --config "$CONFIG" \
+      --device "$TRAIN_DEVICE" --output "$STATS_OUTPUT" "${OVERRIDES[@]}" "$@"
+  fi
+  exec "$PYTHON" -u -m torch.distributed.run \
+    --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
+    --nproc_per_node="$NUM_GPUS" -m msc.data.normalization_stats --config "$CONFIG" \
+    --device "$TRAIN_DEVICE" --output "$STATS_OUTPUT" "${OVERRIDES[@]}" "$@"
 fi
 
 if [[ "${1:-}" == --stats ]]; then

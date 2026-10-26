@@ -61,7 +61,7 @@ class IndexedSpans:
 class ReleaseDataset(Dataset):
     def __init__(self, roots, *, split='train', label_policy='train_default',
                  alignment_policy='allow_estimated', tasks=None, audio_context_sec=.25,
-                 video_context_sec=.25, cache_bytes=128 * 1024**2,
+                 video_context_sec=.25, cache_bytes=128 * 1024**2, cache_dir=None,
                  max_motions_per_task=None, max_windows_per_motion=None, motion_manifest=None):
         import pyarrow as pa
         import pyarrow.compute as pc
@@ -69,13 +69,14 @@ class ReleaseDataset(Dataset):
         from data_pipeline.schema.records import FeatureRecord, ModalityLink
         self._settings = dict(roots=list(roots), split=split, label_policy=label_policy,
             alignment_policy=alignment_policy, tasks=tasks, audio_context_sec=audio_context_sec,
-            video_context_sec=video_context_sec, cache_bytes=cache_bytes,
+            video_context_sec=video_context_sec, cache_bytes=cache_bytes, cache_dir=cache_dir,
             max_motions_per_task=max_motions_per_task, max_windows_per_motion=max_windows_per_motion,
             motion_manifest=motion_manifest)
         self.roots = [Path(p).resolve() for p in roots]
         self.tasks = tasks if tasks is not None else ['text','audio']
         self.contexts = dict(audio=audio_context_sec, video=video_context_sec)
         self.cache_bytes, self.cache, self.codec = cache_bytes, None, None
+        self.cache_dir, self.storage_cache = cache_dir, None
         self.window_reader = None
         self._lookup, self.external_roots = [], []
         tables, identities, features = [], [], []
@@ -174,6 +175,16 @@ class ReleaseDataset(Dataset):
     def __len__(self):
         return int(self.ends[-1]) if len(self.ends) else 0
 
+    @property
+    def episode_ranges(self):
+        import pyarrow as pa
+        table = self.spans.table.select(['release_index', 'motion_id', 'actor_id', 'label_type']).unify_dictionaries()
+        table = table.append_column('window_start', pa.array(np.r_[0, self.ends[:-1]]))
+        table = table.append_column('window_end', pa.array(self.ends))
+        groups = table.group_by(['release_index', 'motion_id', 'actor_id', 'label_type'], use_threads=False).aggregate([
+            ('window_start', 'list'), ('window_end', 'list')]).to_pylist()
+        return [list(zip(row['window_start_list'], row['window_end_list'])) for row in groups]
+
     def __getstate__(self):
         # Spawn workers reopen the shared files instead of pickling the Arrow tables.
         return self._settings
@@ -199,7 +210,7 @@ class ReleaseDataset(Dataset):
         windows = [self.window_identity(index) for index in indices]
         self._init_codec()
         if self.window_reader is None:
-            self.window_reader = MotionWindowReader(self.roots, self.cache)
+            self.window_reader = MotionWindowReader(self.roots, self.cache, self.storage_cache)
         qpos = torch.from_numpy(self.window_reader.read(windows))
         body_pos = self.codec.kinematics.forward_body_positions(qpos)
         history, anchor_pos, anchor_quat = self.codec.prev_state_features_from_history(
@@ -218,6 +229,9 @@ class ReleaseDataset(Dataset):
 
     def _init_codec(self):
         if self.cache is None:
+            if self.cache_dir:
+                from .storage_cache import StorageCache
+                self.storage_cache = StorageCache(self.cache_dir)
             self.cache = ByteCache(self.cache_bytes)
             self.codec = G1MotionFeatureCodec(G1Kinematics(), num_prev_states=5,
                                              canonical_frame_idx=4, rotation_representation='rot6d')
@@ -259,7 +273,15 @@ class ReleaseDataset(Dataset):
         elif task in ('audio','video'):
             link = self._lookup[ri][0][condition[1]]
             feature = self._lookup[ri][1][condition[2]]
-            values, times = self.cache.get(('feature',ri,feature.feature_id), lambda: read_feature(root,feature,self.external_roots[ri]))
+            def load():
+                if self.storage_cache is not None:
+                    from data_pipeline.io import resolve_uri
+                    source = resolve_uri(root, feature.feature_uri, self.external_roots[ri])
+                    cached = self.storage_cache.feature(source, feature)
+                    if cached is not None:
+                        return cached
+                return read_feature(root,feature,self.external_roots[ri])
+            values, times = self.cache.get(('feature',ri,feature.feature_id), load)
             selected, local = select_tokens(times,link,k/30,(k+30)/30,self.contexts[task],feature.token_time_semantics)
             tokens = torch.from_numpy(np.array(values[selected],dtype=np.float32))
             sample[task+'_tokens'] = tokens

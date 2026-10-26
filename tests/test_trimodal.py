@@ -550,6 +550,78 @@ def test_batched_window_reader_codec_and_conditions_parity(release, monkeypatch)
     assert not calls  # Cached row groups are reused across different windows.
 
 
+def test_row_groups_decode_once_per_batch_even_without_lru_capacity(release, monkeypatch):
+    data = ReleaseDataset([release], tasks=['text'], cache_bytes=0)
+    data.__getitems__([0])
+    calls = []
+    original = data.window_reader.decode
+    monkeypatch.setattr(data.window_reader, 'decode', lambda file, group: (calls.append(group) or original(file, group)))
+    indices = [0, 3, 8, 0, 3, 8]
+    actual = data.__getitems__(indices)
+    assert len(calls) == len(set(calls))
+    for index, sample in zip(indices, actual):
+        torch.testing.assert_close(sample['motion_future'], data[index]['motion_future'], rtol=0, atol=0)
+
+
+def test_mmap_storage_cache_preserves_features_and_avoids_parquet_decoding(release, tmp_path, monkeypatch):
+    from pathlib import Path
+    from msc.data.storage_cache import build_storage_cache, StorageCache
+    from msc.data.window_reader import MotionWindowReader
+    import msc.data.release_dataset as module
+    cfg = Config()
+    cfg.data.roots = [str(release)]
+    cfg.data.tasks = ['text', 'audio', 'video']
+    directory = tmp_path/'cache'
+    build_storage_cache(cfg, directory, workers=2, splits=('train',))
+    original = ReleaseDataset([release], tasks=cfg.data.tasks)
+    indices = [original.task_ranges[t][0][0] + i for t in cfg.data.tasks for i in (0, 3, 8)]
+    expected = original.__getitems__(indices)
+    cached = ReleaseDataset([release], tasks=cfg.data.tasks, cache_dir=str(directory))
+    def unexpected(*args, **kwargs):
+        raise AssertionError('Cached training read a Parquet payload')
+    monkeypatch.setattr(MotionWindowReader, 'decode', unexpected)
+    read_feature = module.read_feature
+    def direct_npy(root, feature, external_roots):
+        assert not feature.feature_uri.endswith('.parquet')
+        return read_feature(root, feature, external_roots)
+    monkeypatch.setattr(module, 'read_feature', direct_npy)
+    for left, right in zip(expected, cached.__getitems__(indices)):
+        for key in left:
+            if isinstance(left[key], torch.Tensor):
+                torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
+            else:
+                assert left[key] == right[key]
+    assert original.identity == cached.identity
+    assert cached.__getstate__()['cache_dir'] == str(directory)
+    # Replacing a source invalidates its derivative instead of serving stale data.
+    import os
+    source = next(p for p in StorageCache(directory).entries if '/motion/' in p)
+    stat = Path(source).stat()
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+    assert StorageCache(directory).motion(source) is None
+
+
+def test_packed_feature_mmap_matches_parquet_payload(release, tmp_path):
+    from pathlib import Path
+    from msc.data.storage_cache import convert_source, StorageCache
+    from data_pipeline.release.features import FeatureShardWriter, read_feature
+    data = ReleaseDataset([release], tasks=['audio'])
+    feature = next(iter(data._lookup[0][1].values()))
+    values, times = read_feature(release, feature, data.external_roots[0])
+    writer = FeatureShardWriter(tmp_path/'packed')
+    source = writer.add('audio', feature.feature_id, values, times)
+    writer.close()
+    feature = replace(feature, feature_uri=str(source), timestamp_uri=str(source))
+    directory = tmp_path/'cache'
+    directory.mkdir()
+    key, item = convert_source((str(source), 'feature', {feature.feature_id: feature}, directory))
+    (directory/'manifest.json').write_text(json.dumps(dict(version=1, sources={key:item})))
+    actual = StorageCache(directory).feature(source, feature)
+    assert all(isinstance(value, np.memmap) for value in actual)
+    for left, right in zip((values, times), actual):
+        np.testing.assert_array_equal(left, right)
+
+
 @pytest.mark.integration
 def test_online_t5_dedup_preserves_tokens_and_sample_order():
     import os

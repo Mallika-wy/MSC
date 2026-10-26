@@ -10,11 +10,13 @@ wandb/
 model/
 build/
 dist/
+/deeplearni-2693439.sh
 
 # Track maintained documentation; keep experiment reports and audits local.
 /docs/*
 !/docs/msc_v3.md
 !/docs/msc_v3_2xa6000.md
+!/docs/msc_v3_2xa800.md
 !/docs/msc_dataset_v1.md
 !/docs/Release数据格式说明.md
 !/docs/OMG_Release数据格式说明.md
